@@ -24,9 +24,9 @@ import threading
 import time
 
 import config
-from actions import offset_list, outcomes, path_blocked, shot_chance, tackle_chance
+from actions import WITH_PLAYER, offset_list, outcomes, path_blocked, shot_chance, tackle_chance
 from game import END_TURN, STEP, Move, other_team
-from hex_math import hex_distance, neighbours
+from hex_math import hex_distance, is_in_front, neighbours
 
 
 # --- Evaluation ---
@@ -48,15 +48,24 @@ def evaluate(game, team, start_score):
                     midfield is worth little and the final third a lot.
       shot_chance   the shot chance from where the ball is, for whichever
                     team has it (+ for team, - for the opponent)
-      ball_safety   minus the best tackle chance any adjacent opponent has
-                    against the ball carrier (uses TACKLE_CHANCE, so facing
-                    away from opponents is safer). Only counted when the
-                    carrier's opponents move next: a carrier whose own team
-                    is about to move can still get away.
+      ball_safety   minus the best tackle chance the opponents can set up on
+                    their next turn: an opponent already next to the carrier,
+                    or one who can take their free step next to them, using
+                    TACKLE_CHANCE for the side they'd tackle from. Only
+                    counted when the opponents move next.
+      shot_threat   the best shot chance the carrier's team can set up on its
+                    next turn (free step plus carrying the ball with an
+                    action, then shooting). Only counted when that team
+                    moves next.
       support       for the team with the ball: the fraction of the carrier's
                     teammates who are open for a pass (see open_teammates)
       cover         for a team defending against a ball carrier: the fraction
                     of its players between the ball and their own goal
+      pressing      for a team defending against a ball carrier: 1 if one of
+                    its players is next to the carrier, 0.5 if two tiles away
+                    (close enough to step in and tackle), else 0
+      runs          for the team with the ball: the fraction of the carrier's
+                    teammates who are ahead of the ball and unmarked
     """
     weights = config.AI_WEIGHTS
     return sum(weights[name] * amount for name, amount in evaluation_terms(game, team, start_score).items())
@@ -86,11 +95,15 @@ def evaluation_terms(game, team, start_score):
     if carrier is not None:
         terms["progress"] = progress(board, carrier.team) ** config.AI_PROGRESS_CURVE * side
         terms["shot_chance"] = (shot_chance(board, carrier.team, board.ball) or 0) * side
-        if game.active_team != carrier.team:   # only the team about to move can tackle
-            terms["ball_safety"] = -carrier_exposure(board, carrier_tile) * side
+        if game.active_team != carrier.team:   # the defenders move next: can they tackle?
+            terms["ball_safety"] = -tackle_threat(board, carrier_tile) * side
+        else:                                   # the carrier's team moves next: can it shoot?
+            terms["shot_threat"] = shot_threat(board, carrier_tile) * side
         terms["support"] = open_teammates(board, carrier_tile, occupied) * side
+        terms["runs"] = runs(board, carrier_tile, occupied) * side
 
     terms["cover"] = cover(board, team, occupied) - cover(board, opponent, occupied)
+    terms["pressing"] = pressing(board, team, occupied) - pressing(board, opponent, occupied)
     return terms
 
 
@@ -122,6 +135,57 @@ def carrier_exposure(board, carrier_tile):
         if tile is not None and tile.player is not None and tile.player.team != team:
             best = max(best, tackle_chance(carrier_tile, tile))
     return best
+
+
+def tackle_threat(board, carrier_tile):
+    """Best tackle chance the carrier's opponents can get on their next turn:
+    from a tile next to the carrier that an opponent is on already or can
+    step to (it must be empty), scored by which side of the carrier it is."""
+    team = carrier_tile.player.team
+    facing = carrier_tile.player.facing
+    around = neighbours(carrier_tile.coord)
+    best = 0.0
+    for direction, coord in enumerate(around):
+        tile = board.get(coord)
+        if tile is None:
+            continue
+        if tile.player is not None:
+            reachable = tile.player.team != team          # an opponent already there
+        else:
+            reachable = any(board.get(c) is not None and board.get(c).player is not None
+                            and board.get(c).player.team != team for c in neighbours(coord))
+        if reachable:
+            side = "front" if is_in_front(facing, direction) else "behind"
+            best = max(best, config.TACKLE_CHANCE[side])
+    return best
+
+
+def shot_threat(board, carrier_tile):
+    """Best shot chance the carrier's team can set up next turn: the carrier
+    can get up to 1 + carry_range() tiles nearer the goal (free step, then an
+    action that moves them with the ball), then shoot. Ignores blockers."""
+    distance = hex_distance(board.ball, board.goal_attacked_by(carrier_tile.player.team))
+    closest = max(1, distance - 1 - carry_range())
+    return config.SHOT_CHANCE.get(closest, 0.0)
+
+
+_carry_range_cache = {}
+
+
+def carry_range():
+    """Furthest any action moves a player together with the ball, in tiles."""
+    key = (id(config.ACTIONS), len(config.ACTIONS))
+    if key not in _carry_range_cache:
+        _carry_range_cache.clear()
+        best = 0
+        for action in config.ACTIONS.values():
+            if "self" not in action or "ball" not in action:
+                continue
+            selves = offset_list(action["self"])
+            if action["ball"] == WITH_PLAYER or offset_list(action["ball"]) == selves:
+                best = max([best] + [hex_distance((0, 0), o) for o in selves])
+        _carry_range_cache[key] = best
+    return _carry_range_cache[key]
 
 
 _pass_range_cache = {}
@@ -163,10 +227,42 @@ def open_teammates(board, carrier_tile, occupied=None):
 
 def progress(board, team):
     """How far up the pitch the ball is for team: 0 on the goal team defends,
-    1 on the goal it attacks."""
-    to_attack = hex_distance(board.ball, board.goal_attacked_by(team))
+    up to 1 next to the goal it attacks. The goal tile itself counts the same
+    as the tiles next to it: you can't shoot from it, so it's no better."""
+    to_attack = max(1, hex_distance(board.ball, board.goal_attacked_by(team)))
     to_defend = hex_distance(board.ball, board.goal_attacked_by(other_team(team)))
-    return to_defend / max(to_defend + to_attack, 1)
+    return min(1.0, (to_defend + 1) / max(to_defend + to_attack, 1))
+
+
+def pressing(board, team, occupied=None):
+    """When the opponent has the ball: 1 if one of team's players is next to
+    the carrier, 0.5 if the nearest is two tiles away, 0 otherwise."""
+    carrier = board.get(board.ball).player
+    if carrier is None or carrier.team == team:
+        return 0.0
+    occupied = occupied if occupied is not None else occupied_tiles(board)
+    nearest = min((hex_distance(tile.coord, board.ball) for tile in occupied
+                   if tile.player.team == team), default=99)
+    return 1.0 if nearest == 1 else 0.5 if nearest == 2 else 0.0
+
+
+def runs(board, carrier_tile, occupied=None):
+    """Fraction of the carrier's teammates who are nearer the goal they attack
+    than the ball is, with no opponent standing next to them."""
+    team = carrier_tile.player.team
+    occupied = occupied if occupied is not None else occupied_tiles(board)
+    goal = board.goal_attacked_by(team)
+    ball_gap = hex_distance(board.ball, goal)
+    mates = [tile for tile in occupied if tile.player.team == team and tile is not carrier_tile]
+    if not mates:
+        return 0.0
+
+    def unmarked(tile):
+        return not any(board.get(c) is not None and board.get(c).player is not None
+                       and board.get(c).player.team != team for c in neighbours(tile.coord))
+
+    ahead = sum(1 for tile in mates if hex_distance(tile.coord, goal) < ball_gap and unmarked(tile))
+    return ahead / len(mates)
 
 
 def cover(board, team, occupied=None):
@@ -210,11 +306,52 @@ def wasted_turn(game, tile, action_name):
     return last is not None and is_pure_turn(last)
 
 
+def near_ball(game, tile):
+    """True if this player is within config.AI_FOCUS_RADIUS tiles of the ball."""
+    return hex_distance(tile.coord, game.board.ball) <= config.AI_FOCUS_RADIUS
+
+
 def search_moves(game):
-    """Legal moves, minus ones that can only waste the team's action (see wasted_turn)."""
-    return [move for move in game.legal_moves()
-            if move.coord is None
-            or not wasted_turn(game, game.board.get(move.coord), move.action)]
+    """The moves the tree search considers: legal moves, minus turns that
+    would only flip a player straight back (see wasted_turn), and minus free
+    steps for players away from the ball, which positioning_step handles."""
+    moves = []
+    for move in game.legal_moves():
+        if move.coord is not None:
+            tile = game.board.get(move.coord)
+            if move.action == STEP and not near_ball(game, tile):
+                continue
+            if wasted_turn(game, tile, move.action):
+                continue
+        moves.append(move)
+    return moves
+
+
+def positioning_step(game):
+    """The best free step for a player away from the ball: whichever step
+    raises the evaluation most, if by at least config.AI_POSITION_MIN_GAIN.
+    None if no step for such a player helps (they stay where they are).
+
+    This replaces searching those steps: far from the ball they mostly
+    affect support, runs, cover and pressing, which the evaluation measures
+    directly, so a quick one-step check chooses them well and leaves the
+    search's time for the ball."""
+    team = game.active_team
+    before = dict(game.score)
+    base = evaluate(game, team, before)
+    best, best_gain = None, config.AI_POSITION_MIN_GAIN
+    saved = game.snapshot()
+    for tile in game.own_tiles():
+        if not game.can_step(tile) or near_ball(game, tile):
+            continue
+        for target in game.step_targets(tile):
+            move = Move(tile.coord, STEP, target)
+            game.perform(move)
+            gain = evaluate(game, team, before) - base
+            game.restore(saved)
+            if gain > best_gain:
+                best, best_gain = move, gain
+    return best
 
 
 def deterministic(move):
@@ -309,10 +446,34 @@ def rank_moves(game, moves, rng):
     Used so the search looks at plausible moves first and adds the rest
     gradually, and to give new moves a starting value."""
     team = game.active_team
-    scored = [(expected_value(game, move, team) - config.AI_ACTION_COST * action_charge(move), move)
-              for move in moves]
+    scored = []
+    for move in moves:
+        if move.action == STEP and move.coord == game.board.ball:
+            value = step_then_act_value(game, move, team)
+        else:
+            value = expected_value(game, move, team) - config.AI_ACTION_COST * action_charge(move)
+        scored.append((value, move))
     scored.sort(key=lambda pair: pair[0], reverse=True)
     return [move for _, move in scored], {move: value for value, move in scored}
+
+
+def step_then_act_value(game, move, team):
+    """For the ball carrier's free step: the value after the step, or after
+    the step plus the best single action that follows it if that's higher.
+    So a step that sets up a shot (or a pass, or a dribble) is valued for
+    what it makes possible, and the search tries "step, then act"."""
+    before = dict(game.score)
+    saved = game.snapshot()
+    game.perform(move)
+    best = evaluate(game, team, before)
+    tile = game.board.get(move.target)
+    if game.actions_left() > 0 and tile.player is not None:
+        for name in tile.player.actions:
+            for target in outcomes(game.board, tile, name):
+                follow = Move(tile.coord, name, target)
+                best = max(best, expected_value(game, follow, team) - config.AI_ACTION_COST)
+    game.restore(saved)
+    return best
 
 
 def expected_value(game, move, team):
@@ -494,6 +655,15 @@ def search(game, seconds=None, max_iterations=None, rng=None, root=None):
     return SearchResult(best.move, iterations, root)
 
 
+def choose(game, seconds=None, max_iterations=None, rng=None, root=None):
+    """The AI's next move: a positioning step for a player away from the ball
+    if one helps (instant), otherwise the tree search's choice."""
+    step = positioning_step(game)
+    if step is not None:
+        return SearchResult(step, 0, Node())
+    return search(game, seconds, max_iterations, rng, root)
+
+
 # --- Playing in the live game ---
 
 class AIController:
@@ -513,6 +683,7 @@ class AIController:
         self.play_at = 0.0
         self.plan = None          # search tree to continue from after the pending move
         self.plan_turn = None     # the turn that plan belongs to
+        self.turn_player = None   # planner.TurnPlayer, when config.AI_ENGINE is "planner"
         self.verbose = config.AI_DEBUG
 
     @staticmethod
@@ -565,4 +736,14 @@ class AIController:
                 game.action = None if result.move.action == STEP else result.move.action
 
     def _search(self, snapshot, seed, plan):
-        self.result = search(snapshot, rng=random.Random(seed), root=plan)
+        if config.AI_ENGINE == "planner":
+            if self.turn_player is None:
+                from planner import TurnPlayer      # here, not at the top: planner imports ai
+                self.turn_player = TurnPlayer()
+            move = self.turn_player.next_move(snapshot)
+            self.result = SearchResult(move, 0, Node())
+            if self.verbose and self.turn_player.last_info:
+                print(f"planner: {self.turn_player.last_info}")
+                self.turn_player.last_info = {}
+        else:
+            self.result = choose(snapshot, rng=random.Random(seed), root=plan)

@@ -2,7 +2,7 @@
 SCREEN_SIZE = (800, 600)
 HEX_SIZE = 30         # centre-to-corner radius of each drawn hex
 HEX_GAP = 4           # gap between neighbouring hex edges in pixels (0 = touching)
-BOARD_COLS = 13
+BOARD_COLS = 13      # keep both odd so there's a middle row for the goals and a centre spot
 BOARD_ROWS = 9
 ORIGIN = (60, 60)     # pixel position of the centre of hex (0, 0)
 BALL_RADIUS = 8
@@ -175,14 +175,11 @@ ACTIONS = {
     "dribble": {                # run with the ball, forward-up or forward-down
         "requires": ["possession"],
         "self": [(2, -1), (1, 1)],
-        "ball": "with_player",
-        "lofted": True
+        "ball": "with_player"
     },
-    "drag back": {              # step back with the ball and turn to face the other way
+    "backpass": {              # step back with the ball and turn to face the other way
         "requires": ["possession"],
-        "self": (-1, 0),
-        "ball": (-1, 0),
-        "turn": True,
+        "ball": [(-2, 1), (-1, -1)],
     },
     "tackle": {                 # try to win the ball from an adjacent opponent
         "tackle": True,
@@ -213,28 +210,45 @@ FACING_HALF_WIDTH = 6  # half the width of the back edge
 # Kick-off positions, by team. Every key here is a team.
 # "actions" are names from ACTIONS, shown as buttons in this order.
 # Add "facing": RIGHT or LEFT to an entry to override TEAM_FACING.
-OUTFIELD_ACTIONS = ["reposition", "dribble", "sprint", "pass", "lob", "pass and move", "drag back",
+OUTFIELD_ACTIONS = ["reposition", "dribble", "sprint", "pass", "lob", "pass and move", "backpass",
                     "tackle", "shoot"]
+# 2-2-1 formation, Away a mirror image of Home. On this 13 x 9 pitch the
+# goals are (-2, 4) and (10, 4) and the centre spot is (4, 4).
 INITIAL_SETUP = {
-    HOME: [
-        {"actions": OUTFIELD_ACTIONS, "position": (1, 2)},
-        {"actions": OUTFIELD_ACTIONS, "position": (-1, 6)},
-        {"actions": OUTFIELD_ACTIONS, "position": (3, 4)},
+    HOME: [                                                   # attacking right
+        {"actions": OUTFIELD_ACTIONS, "position": (0, 3)},    # defender, top
+        {"actions": OUTFIELD_ACTIONS, "position": (-1, 5)},   # defender, bottom
+        {"actions": OUTFIELD_ACTIONS, "position": (3, 1)},    # midfielder, top wing
+        {"actions": OUTFIELD_ACTIONS, "position": (0, 7)},    # midfielder, bottom wing
+        {"actions": OUTFIELD_ACTIONS, "position": (3, 4)},    # striker, next to the ball
     ],
-    AWAY: [
-        {"actions": OUTFIELD_ACTIONS, "position": (9, 2)},
-        {"actions": OUTFIELD_ACTIONS, "position": (7, 6)},
-        {"actions": OUTFIELD_ACTIONS, "position": (5, 4)},
+    AWAY: [                                                   # attacking left
+        {"actions": OUTFIELD_ACTIONS, "position": (9, 3)},    # defender, top
+        {"actions": OUTFIELD_ACTIONS, "position": (8, 5)},    # defender, bottom
+        {"actions": OUTFIELD_ACTIONS, "position": (8, 1)},    # midfielder, top wing
+        {"actions": OUTFIELD_ACTIONS, "position": (5, 7)},    # midfielder, bottom wing
+        {"actions": OUTFIELD_ACTIONS, "position": (5, 4)},    # striker, next to the ball
     ],
 }
-INITIAL_BALL = (4, 4)
+INITIAL_BALL = (4, 4)   # centre spot
 
 # --- Computer players ---
 # Who plays each team: "human" or "ai". Set both to "ai" to watch.
-CONTROLLERS = {HOME: "ai", AWAY: "ai"}
+CONTROLLERS = {HOME: "human", AWAY: "ai"}
 
-AI_THINK_SECONDS = 1.0    # search time before each action
-AI_MOVE_DELAY = 0.6       # seconds the chosen action is shown before it's played
+# Which computer player to use:
+#   "planner" - plans whole turns and checks them against the opponent's best
+#               reply (planner.py). Thinks once per turn, then plays the plan.
+#   "mcts"    - Monte Carlo Tree Search, one move at a time (ai.py).
+AI_ENGINE = "planner"
+AI_PLAN_SECONDS = 5.0     # planner: thinking time at the start of a turn (and after dice)
+AI_PLAN_WIDTH = 16        # planner: partial plans kept at each step of the turn search
+AI_PLANS_CHECKED = 20     # planner: best plans checked against the opponent's replies
+AI_REPLY_WIDTH = 8        # planner: partial plans kept when searching the opponent's replies
+AI_REPLIES_CHECKED = 4    # planner: best replies tried against each plan (the worst one counts)
+
+AI_THINK_SECONDS = 1.0    # mcts: search time before each action
+AI_MOVE_DELAY = 2       # seconds the chosen action is shown before it's played
 AI_LOOKAHEAD_TURNS = 4    # turn changes to simulate before judging: 2 = to the end
                           # of the opponent's next turn
 AI_EXPLORATION = 0.25     # UCT exploration constant: higher spreads the search over more
@@ -247,6 +261,9 @@ AI_WIDENING_POWER = 0.5   # quick check and the search considers the best
                           # AI_WIDENING * visits ** AI_WIDENING_POWER of them
 AI_PRIOR_VISITS = 2       # new moves start with this many pretend visits at their quick-check
                           # value, so an unlucky first roll (e.g. a missed 80% shot) can't bury them
+AI_FOCUS_RADIUS = 2       # free steps for players within this many tiles of the ball are
+                          # searched; players further away step by a quick positioning check
+AI_POSITION_MIN_GAIN = 0.005  # a far player only steps if it improves the evaluation this much
 AI_PLAYOUT_CANDIDATES = 4  # random moves each simulated player weighs up per step
 AI_PLAYOUT_RANDOM = 0.2   # chance a simulated move is purely random instead
 AI_SEED = None            # set to a number to make the AI's choices repeatable
@@ -266,9 +283,12 @@ AI_WEIGHTS = {
     "loose_ball": 0.15,    # nobody has it: your nearest player closer to it than theirs
     "progress": 0.8,       # holding the ball: 0 at your own goal up to this at theirs (curved)
     "shot_chance": 0.1,    # times the shot chance from where the ball is, for its holder
-    "ball_safety": 0.12,   # minus the best tackle chance against your carrier, if they can be tackled next
+    "ball_safety": 0.15,   # minus the best tackle chance opponents can set up on your carrier next turn
+    "shot_threat": 0.3,    # the best shot chance your carrier can set up next turn
     "support": 0.1,        # fraction of the carrier's teammates open for a pass
     "cover": 0.1,          # defending a carrier: fraction of players goal-side of the ball
+    "pressing": 0.08,      # defending a carrier: a player next to them (1) or 2 tiles away (0.5)
+    "runs": 0.08,          # with the ball: fraction of teammates ahead of it and unmarked
 }
 # Keep possession + progress + shot_chance well below "goal": holding the ball
 # next to goal has to be worth less than an 80% shot, or the AI stops shooting.

@@ -36,7 +36,7 @@ from typing import Optional
 
 import config
 from hex_math import (flipped, hex_distance, is_in_front, neighbours, offset_for_facing,
-                      tiles_between)
+                      rectangle_coords, tiles_between)
 
 
 # --- Requirements ---
@@ -350,11 +350,13 @@ def validate_config():
             if not is_chance(value):
                 raise ValueError(f"config.{table}[{key!r}] must be a chance from 0 to 1")
 
+    if config.AI_ENGINE not in ("planner", "mcts"):
+        raise ValueError("config.AI_ENGINE must be 'planner' or 'mcts'")
     for team, controller in config.CONTROLLERS.items():
         if controller not in ("human", "ai"):
             raise ValueError(f"config.CONTROLLERS[{team!r}] must be 'human' or 'ai'")
     weight_keys = {"goal", "possession", "loose_ball", "progress", "shot_chance",
-                   "ball_safety", "support", "cover"}
+                   "ball_safety", "shot_threat", "support", "cover", "pressing", "runs"}
     if set(config.AI_WEIGHTS) != weight_keys:
         raise ValueError(f"config.AI_WEIGHTS needs exactly the keys {sorted(weight_keys)}")
 
@@ -366,6 +368,22 @@ def validate_config():
             if "facing" in entry and entry["facing"] not in (config.RIGHT, config.LEFT):
                 raise ValueError(f"A player at {entry['position']} has facing {entry['facing']!r}; "
                                  f"it must be RIGHT or LEFT")
+
+    board_coords = set(rectangle_coords(config.BOARD_COLS, config.BOARD_ROWS))
+    taken = {}
+    for team, entries in config.INITIAL_SETUP.items():
+        for entry in entries:
+            position = entry["position"]
+            if position not in board_coords:
+                raise ValueError(f"Starting position {position} is off the "
+                                 f"{config.BOARD_COLS} x {config.BOARD_ROWS} board")
+            if position in taken:
+                raise ValueError(f"Two players start on {position} "
+                                 f"({config.TEAM_NAMES[taken[position]]} and "
+                                 f"{config.TEAM_NAMES[team]}): every player needs their own tile")
+            taken[position] = team
+    if config.INITIAL_BALL not in board_coords:
+        raise ValueError(f"INITIAL_BALL {config.INITIAL_BALL} is off the board")
 
     used = list(config.DEFAULT_ACTIONS)
     for entries in config.INITIAL_SETUP.values():
