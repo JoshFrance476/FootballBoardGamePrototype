@@ -10,7 +10,7 @@ BORDER_WIDTH = 4      # default tile border thickness in pixels
 SELECTED_BORDER_WIDTH = 5
 FONT_NAME = "bahnschrift"
 FONT_SIZE = 32
-UI_POSITION = (10, 480)     # team and action points; status message follows it
+UI_POSITION = (10, 480)     # whose turn and what's left; status message follows it
 SCORE_Y = 6                 # score, centred across the top of the screen
 
 # Action buttons, laid out left to right along the bottom of the screen,
@@ -45,6 +45,8 @@ BALL_COLOUR = WHITE
 BACKGROUND_COLOUR = WHITE
 SELECTED_COLOUR = YELLOW
 MOVE_TARGET_COLOUR = BLACK
+STEP_TARGET_COLOUR = (120, 230, 255)   # pale cyan: tiles the selected player can step to
+STEP_TARGET_WIDTH = 3
 
 BUTTON_COLOUR = DARK_GREY
 BUTTON_TEXT_COLOUR = WHITE
@@ -65,21 +67,23 @@ ATTACKING_GOAL = {HOME: "right", AWAY: "left"}       # the goal each team shoots
 GOAL_COLOURS = {"left": LIGHT_BLUE, "right": LIGHT_RED}  # tinted for the defending team
 
 # --- Rules ---
-ACTION_POINTS_PER_TURN = 8   # each team's budget, spent on any of its players
+# Each turn: every player may take one free step to an empty neighbouring
+# tile (carrying the ball if they have it), and the team gets one action for
+# any of its players, plus one more each time a player gets the ball for the
+# first time that turn (holding it at the start of the turn counts; so do
+# receiving a pass, a tackle, or picking up a loose ball). See game.py.
 
-# Moving turns a player to face the direction they moved in. For moves that
-# aren't in a straight hex line, that's the nearest of the six directions;
-# a move exactly between two keeps the one closer to their old facing.
-# An action's own "rotate" setting overrides this.
-FACE_MOVEMENT = True
+# Facing: players only face right or left. The free step turns a player to
+# face the side they stepped towards (straight up/down keeps their facing).
+# Actions never change facing unless they have "turn": True.
+RIGHT, LEFT = 0, 3   # same values as hex_math.RIGHT / hex_math.LEFT
 
-# Chance a tackle wins the ball, by where the tackler stands relative to the
-# way the ball carrier is facing.
+# Chance a tackle wins the ball, by which side of the ball carrier the
+# tackler is on. "front" is the three neighbouring tiles on the side the
+# carrier is facing, "behind" the three on the other side.
 TACKLE_CHANCE = {
-    "head on": 0.8,      # on the tile the carrier is facing
-    "front side": 0.6,   # on either tile next to that one
-    "back side": 0.4,    # on either tile next to the one behind them
-    "behind": 0.2,       # on the tile directly behind them
+    "front": 0.8,
+    "behind": 0.4,
 }
 
 # Chance a shot scores, by distance from the goal in tiles. A player
@@ -106,96 +110,98 @@ SHOT_CHANCE = {
 #               let the player choose: each valid option is highlighted and
 #               they click the one they want. Options that are off the board
 #               (or, for "self", occupied) are left out.
+#               "ball": "with_player" sends the ball wherever the player
+#               moves, so a "self" list becomes a single choice for both,
+#               e.g. a dribble in a chosen direction (see "dribble" below).
 #               Moves can't pass through an opponent: if the straight line
 #               from the player's tile to the destination touches a tile
 #               with an opponent on it (even just an edge or corner), that
 #               option isn't allowed. Teammates don't block, and a ball can
 #               still be passed onto an opponent's tile.
 #   "lofted":   True to let this action's ball fly over opponents, so it
-#               can't be blocked.
-#   "rotate":   turns to make, 60 degrees clockwise each (1 = right,
-#               -1 = left, 3 = about-face), or "any" to let the player
-#               choose by clicking the tile they want to face. Counted from
-#               the way the player faced before the action.
-#               Without "rotate", a player who moves ends up facing the
-#               way they moved (see FACE_MOVEMENT).
-#   An action can offer only one choice: a "self" list, a "ball" list or
-#   "rotate": "any", so one click always settles it.
+#               can't be blocked. With "ball": "with_player", the player
+#               goes over them too while carrying the ball (the destination
+#               must still be empty). Without the ball, the move is blocked
+#               as normal.
+#   "turn":     True to flip the player round to face the other way at the
+#               end of the action. Without it, an action never changes
+#               which way the player faces, even if it moves them.
+#   An action can offer only one choice: a "self" list or a "ball" list, so
+#   one click always settles it.
 #   "shoot":    True to shoot at the goal, with a chance from SHOT_CHANCE.
 #               The player must have the ball at their feet by this point.
 #               A goal sends everyone back to kick-off and gives the next
 #               turn to the team that conceded. A miss leaves the ball loose
 #               on the goal tile. Opponents in the way don't block shots.
 # Plus:
-#   "cost":     action points it uses. Required.
 #   "requires": list of conditions that must hold first. Leave it out (or
 #               use []) for actions allowed whether or not you have the ball.
 #                 "possession"    - the player has the ball
 #                 "no_possession" - the player doesn't have the ball
 #               (more can be added in actions.REQUIREMENTS)
 #
-# Offsets are axial (dq, dr) steps written as if the player faces east,
-# turned to match the way they actually face before the action:
-#   (1, 0) forward      (-1, 0) back
-#   (1, -1) forward-left  (0, 1) forward-right
-#   (0, -1) back-left     (-1, 1) back-right
-# Bigger numbers go further, e.g. (2, 0) is two steps forward.
+# Offsets are axial (dq, dr) steps written for a player facing right. For a
+# player facing left they're mirrored left-to-right, so "forward" means
+# towards whichever way they face and up/down on screen stay the same:
+#   (1, 0) forward         (-1, 0) back
+#   (1, -1) forward-up     (0, 1) forward-down
+#   (0, -1) back-up        (-1, 1) back-down
+# Bigger numbers go further, e.g. (2, 0) is two steps forward. To let a
+# player go diagonally as well as straight, give a list, e.g.
+# "self": [(1, -1), (1, 0), (0, 1)] for forward-up, forward or forward-down.
 ACTIONS = {
     "reposition": {             # step forward, dribbling the ball if you have it
-        "cost": 1,
-        "self": (1, 0),
-        "ball": (1, 0),
+        "self": [(1, 0), (-1,0), (1, -1), (0, 1), (0, -1), (-1, 1)],
+        "ball": "with_player",
     },
     "sprint": {                 # two steps forward, only without the ball
-        "cost": 2,
         "requires": ["no_possession"],
-        "self": (3, 0),
+        "self": [(3, 0), (3, -3), (0, 3)],
     },
     "pass": {
-        "cost": 1,
         "requires": ["possession"],
-        "ball": (3, 0),
+        "ball": [(2, 0), (0, 2), (2, -2)],
     },
     "lob": {                    # long ball over the top: can't be blocked
-        "cost": 2,
         "requires": ["possession"],
-        "ball": (5, 0),
+        "ball": [(5, 0), (0, 5), (5, -5)],
         "lofted": True,
     },
     "pass and move": {
-        "cost": 2,
         "requires": ["possession"],
         "self": (2, 0),
         "ball": [(1, 2), (3, -2)]
     },
+    "dribble": {                # run with the ball, forward-up or forward-down
+        "requires": ["possession"],
+        "self": [(2, -1), (1, 1)],
+        "ball": "with_player",
+        "lofted": True
+    },
     "drag back": {              # step back with the ball and turn to face the other way
-        "cost": 1,
         "requires": ["possession"],
         "self": (-1, 0),
         "ball": (-1, 0),
-        "rotate": 3,
+        "turn": True,
     },
     "tackle": {                 # try to win the ball from an adjacent opponent
-        "cost": 2,
         "tackle": True,
     },
     "shoot": {
-        "cost": 2,
         "requires": ["possession"],
         "shoot": True,
     },
-    "rotate": {
-        "cost": 1,
-        "rotate": "any",
+    "turn": {                   # flip round to face the other way
+        "turn": True,
     },
 }
 
-# Actions every player gets, added after the ones listed in INITIAL_SETUP
-DEFAULT_ACTIONS = ["rotate"]
+# Actions every player gets, added after the ones listed in INITIAL_SETUP.
+# (Turning uses the turn's action; a free step to the other side also turns them.)
+DEFAULT_ACTIONS = ["turn"]
 
-# Direction each team's players face at kick-off (index into hex_math.DIRECTIONS)
-EAST, WEST = 0, 3
-TEAM_FACING = {HOME: EAST, AWAY: WEST}
+# Which way each team's players face at kick-off
+TEAM_FACING = {HOME: RIGHT, AWAY: LEFT}
 
 # Facing marker: a small triangle inside the tile, pointing the way the
 # player faces. Distances are pixels from the tile centre.
@@ -206,8 +212,9 @@ FACING_HALF_WIDTH = 6  # half the width of the back edge
 
 # Kick-off positions, by team. Every key here is a team.
 # "actions" are names from ACTIONS, shown as buttons in this order.
-# Add "facing": <direction index> to an entry to override TEAM_FACING.
-OUTFIELD_ACTIONS = ["reposition", "sprint", "pass","lob", "pass and move", "drag back", "tackle", "shoot"]
+# Add "facing": RIGHT or LEFT to an entry to override TEAM_FACING.
+OUTFIELD_ACTIONS = ["reposition", "dribble", "sprint", "pass", "lob", "pass and move", "drag back",
+                    "tackle", "shoot"]
 INITIAL_SETUP = {
     HOME: [
         {"actions": OUTFIELD_ACTIONS, "position": (1, 2)},
@@ -228,13 +235,13 @@ CONTROLLERS = {HOME: "ai", AWAY: "ai"}
 
 AI_THINK_SECONDS = 1.0    # search time before each action
 AI_MOVE_DELAY = 0.6       # seconds the chosen action is shown before it's played
-AI_LOOKAHEAD_TURNS = 2    # turn changes to simulate before judging: 2 = to the end
+AI_LOOKAHEAD_TURNS = 4    # turn changes to simulate before judging: 2 = to the end
                           # of the opponent's next turn
 AI_EXPLORATION = 0.25     # UCT exploration constant: higher spreads the search over more
                           # alternatives. Moves usually differ by ~0.05 in value, so 1.0
                           # spread it so evenly the choice was near-random; 0.25 tested best.
-AI_AP_COST = 0.01         # small charge per action point spent, so an action has to
-                          # help to be chosen; stops near-pointless moves winning on noise
+AI_ACTION_COST = 0.01     # small charge per action used, so an action has to help to be
+                          # chosen; stops near-pointless moves winning on noise
 AI_WIDENING = 2.0         # progressive widening: a position's moves are ranked by a
 AI_WIDENING_POWER = 0.5   # quick check and the search considers the best
                           # AI_WIDENING * visits ** AI_WIDENING_POWER of them

@@ -57,6 +57,48 @@ def hex_distance(a, b):
     return (abs(dq) + abs(dr) + abs(dq + dr)) // 2
 
 
+# Players only face right or left. These are indexes into DIRECTIONS, so a
+# right-facing player's "facing" neighbour is the east one, a left-facing
+# player's the west one.
+RIGHT, LEFT = 0, 3
+
+
+def flipped(facing):
+    """The opposite facing: right <-> left."""
+    return LEFT if facing == RIGHT else RIGHT
+
+
+@lru_cache(maxsize=None)
+def mirror_offset(offset):
+    """An offset reflected left-to-right: same row, opposite side.
+    (q, r) -> (-q - r, r) keeps r (the row) and negates the on-screen x."""
+    q, r = offset
+    return (-q - r, r)
+
+
+def offset_for_facing(offset, facing):
+    """An action offset (written for a right-facing player) as it applies to a
+    player facing `facing`: unchanged facing right, mirrored facing left."""
+    return offset if facing == RIGHT else mirror_offset(offset)
+
+
+def facing_after_move(start, end, current):
+    """Which way a player faces after moving from start to end: the side they
+    moved towards, or their current facing if the move was straight up/down."""
+    dx = hex_to_pixel(*end, 1)[0] - hex_to_pixel(*start, 1)[0]
+    if abs(dx) < 1e-9:
+        return current
+    return RIGHT if dx > 0 else LEFT
+
+
+def is_in_front(facing, direction):
+    """True if a neighbour in DIRECTIONS[direction] is on the side a player
+    with this facing is looking at. Every hex neighbour is either to the
+    right (east, north-east, south-east) or to the left."""
+    to_the_right = direction in (0, 1, 5)
+    return to_the_right == (facing == RIGHT)
+
+
 @lru_cache(maxsize=None)
 def direction_toward(a, b, prefer=None):
     """Index into DIRECTIONS that points most nearly from hex a toward hex b.

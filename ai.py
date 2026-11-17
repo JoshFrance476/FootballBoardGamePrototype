@@ -25,7 +25,7 @@ import time
 
 import config
 from actions import offset_list, outcomes, path_blocked, shot_chance, tackle_chance
-from game import END_TURN, Move, other_team
+from game import END_TURN, STEP, Move, other_team
 from hex_math import hex_distance, neighbours
 
 
@@ -186,59 +186,84 @@ def cover(board, team, occupied=None):
 
 # --- Moves worth considering ---
 
-_pure_rotation_cache = {}
+_pure_turn_cache = {}
 
 
-def is_pure_rotation(action_name):
-    """True for an action that only turns the player (no movement, ball, tackle or shot)."""
+def is_pure_turn(action_name):
+    """True for an action that only flips the player round (no movement, ball,
+    tackle or shot)."""
     action = config.ACTIONS[action_name]
     key = (action_name, id(action))
-    if key not in _pure_rotation_cache:
-        _pure_rotation_cache[key] = bool(action.get("rotate")) and not any(
+    if key not in _pure_turn_cache:
+        _pure_turn_cache[key] = bool(action.get("turn")) and not any(
             action.get(k) for k in ("self", "ball", "tackle", "shoot"))
-    return _pure_rotation_cache[key]
+    return _pure_turn_cache[key]
 
 
-def wasted_rotation(game, tile, action_name):
-    """True if this would be a second turn in a row for the same player, when
-    one free rotation ("rotate": "any") could have done both."""
-    if not is_pure_rotation(action_name):
+def wasted_turn(game, tile, action_name):
+    """True if this would flip a player straight back round: a pure turn
+    right after their last action was also a pure turn. Two flips undo each
+    other, so the second can only waste the action."""
+    if action_name == STEP or not is_pure_turn(action_name):
         return False
     last = game.last_actions.get(tile.coord)
-    if last is None or not is_pure_rotation(last):
-        return False
-    return any(config.ACTIONS[name].get("rotate") == "any" and is_pure_rotation(name)
-               for name in tile.player.actions)
+    return last is not None and is_pure_turn(last)
 
 
 def search_moves(game):
-    """Legal moves, minus ones that can only waste action points (see wasted_rotation)."""
+    """Legal moves, minus ones that can only waste the team's action (see wasted_turn)."""
     return [move for move in game.legal_moves()
             if move.coord is None
-            or not wasted_rotation(game, game.board.get(move.coord), move.action)]
+            or not wasted_turn(game, game.board.get(move.coord), move.action)]
 
 
 def deterministic(move):
     """True if the move involves no dice (no tackle, no shot)."""
-    if move == END_TURN:
+    if move == END_TURN or move.action == STEP:
         return True
     action = config.ACTIONS[move.action]
     return not action.get("tackle") and not action.get("shoot")
 
 
+def action_charge(move):
+    """1 for a move that uses one of the team's actions, 0 for a step or End turn."""
+    return 0 if move == END_TURN or move.action == STEP else 1
+
+
 # --- Playouts ---
 
+def move_kinds(game):
+    """(tile, "step" or action name) pairs the team could use right now,
+    skipping turns that would only flip a player straight back."""
+    kinds = []
+    for tile in game.own_tiles():
+        if game.can_step(tile):
+            kinds.append((tile, STEP))
+        if game.can_act(tile):
+            kinds.extend((tile, name) for name in tile.player.actions
+                         if not wasted_turn(game, tile, name))
+    return kinds
+
+
+def random_of_kind(game, tile, kind, rng):
+    """A random move of this kind for this player, or None if there isn't one."""
+    if kind == STEP:
+        targets = game.step_targets(tile)
+        return Move(tile.coord, STEP, rng.choice(targets)) if targets else None
+    options = outcomes(game.board, tile, kind)
+    return Move(tile.coord, kind, rng.choice(list(options))) if options else None
+
+
 def random_move(game, rng):
-    """A random legal move, cheaply: try random (player, action) pairs until
-    one can be used, then pick one of its targets. End turn when nothing can."""
-    pairs = [(tile, name) for tile in game.own_tiles()
-             for name in tile.player.actions
-             if game.affordable(name) and not wasted_rotation(game, tile, name)]
-    rng.shuffle(pairs)
-    for tile, name in pairs:
-        options = outcomes(game.board, tile, name)
-        if options:
-            return Move(tile.coord, name, rng.choice(list(options)))
+    """A random legal move, cheaply: try random (player, step-or-action)
+    pairs until one is possible, then pick a random target. End turn when
+    nothing is."""
+    kinds = move_kinds(game)
+    rng.shuffle(kinds)
+    for tile, kind in kinds:
+        move = random_of_kind(game, tile, kind, rng)
+        if move is not None:
+            return move
     return END_TURN
 
 
@@ -254,15 +279,13 @@ def playout_move(game, rng):
         return random_move(game, rng)
 
     team = game.active_team
-    pairs = [(tile, name) for tile in game.own_tiles()
-             for name in tile.player.actions
-             if game.affordable(name) and not wasted_rotation(game, tile, name)]
-    rng.shuffle(pairs)
+    kinds = move_kinds(game)
+    rng.shuffle(kinds)
     candidates = [END_TURN]
-    for tile, name in pairs:
-        options = outcomes(game.board, tile, name)
-        if options:
-            candidates.append(Move(tile.coord, name, rng.choice(list(options))))
+    for tile, kind in kinds:
+        move = random_of_kind(game, tile, kind, rng)
+        if move is not None:
+            candidates.append(move)
             if len(candidates) > config.AI_PLAYOUT_CANDIDATES:
                 break
 
@@ -282,14 +305,12 @@ def playout_move(game, rng):
 
 def rank_moves(game, moves, rng):
     """(moves sorted best first, {move: value}) for the team to move, by
-    trying each and evaluating the result (minus the action point charge).
+    trying each and evaluating the result (minus the action charge).
     Used so the search looks at plausible moves first and adds the rest
     gradually, and to give new moves a starting value."""
     team = game.active_team
-    scored = []
-    for move in moves:
-        cost = 0 if move == END_TURN else config.ACTIONS[move.action]["cost"]
-        scored.append((expected_value(game, move, team) - config.AI_AP_COST * cost, move))
+    scored = [(expected_value(game, move, team) - config.AI_ACTION_COST * action_charge(move), move)
+              for move in moves]
     scored.sort(key=lambda pair: pair[0], reverse=True)
     return [move for _, move in scored], {move: value for value, move in scored}
 
@@ -390,9 +411,9 @@ def search(game, seconds=None, max_iterations=None, rng=None, root=None):
     result's subtree_after) to carry on from an earlier search's plan.
 
     Each simulation's score also includes a small charge of
-    config.AI_AP_COST per action point each team spends on moves chosen in
-    the tree (against that team), so an action has to actually help to be
-    worth its cost. Moves in playouts aren't charged.
+    config.AI_ACTION_COST per action each team uses on moves chosen in the
+    tree (against that team), so an action has to actually help to be worth
+    using. Steps and moves in playouts aren't charged.
 
     Progressive widening: at each node the moves are ranked once by a quick
     one-step evaluation (rank_moves), and only the best widened(node) of
@@ -407,7 +428,7 @@ def search(game, seconds=None, max_iterations=None, rng=None, root=None):
     start_score = dict(game.score)
     horizon = game.turn_number + config.AI_LOOKAHEAD_TURNS
     exploration = config.AI_EXPLORATION
-    ap_cost = config.AI_AP_COST
+    action_cost = config.AI_ACTION_COST
     opponent = other_team(team)
 
     root = root if root is not None else Node()
@@ -421,11 +442,11 @@ def search(game, seconds=None, max_iterations=None, rng=None, root=None):
         iterations += 1
         sim = game.clone(roll=rng.random)
         node = root
-        spent = {team: 0, opponent: 0}      # action points used in this simulation
+        spent = {team: 0, opponent: 0}      # actions used on tree moves in this simulation
 
         def play(move, charge=True):
-            if charge and move != END_TURN:
-                spent[sim.active_team] += config.ACTIONS[move.action]["cost"]
+            if charge:
+                spent[sim.active_team] += action_charge(move)
             sim.perform(move)
 
         # Selection and expansion
@@ -462,7 +483,7 @@ def search(game, seconds=None, max_iterations=None, rng=None, root=None):
             play(playout_move(sim, rng), charge=False)
 
         # Backpropagation
-        value = evaluate(sim, team, start_score) - ap_cost * (spent[team] - spent[opponent])
+        value = evaluate(sim, team, start_score) - action_cost * (spent[team] - spent[opponent])
         root.visits += 1
         while node is not root:
             node.visits += 1
@@ -539,7 +560,9 @@ class AIController:
             self.play_at = time.perf_counter() + config.AI_MOVE_DELAY
             if result.move != END_TURN:
                 game.selected = game.board.get(result.move.coord)
-                game.action = result.move.action
+                # For a step, selecting the player shows their step tiles; the
+                # chosen one is marked by highlight
+                game.action = None if result.move.action == STEP else result.move.action
 
     def _search(self, snapshot, seed, plan):
         self.result = search(snapshot, rng=random.Random(seed), root=plan)

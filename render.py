@@ -97,8 +97,9 @@ class Renderer:
         button shows that instead. highlight: a tile to mark as the AI's choice."""
         self.screen.fill(config.BACKGROUND_COLOUR)
         targets = set(game.targets)
+        steps = set(game.selected_step_targets)
         for tile in game.board:
-            border = self.tile_border(tile, game.selected, targets, highlight)
+            border = self.tile_border(tile, game.selected, targets, highlight, steps)
             self.draw_tile(tile, border, game.board)
         self.draw_ball(game.board.ball)
         self.draw_player_previews(game)
@@ -110,12 +111,14 @@ class Renderer:
 
     # --- Board ---
 
-    def tile_border(self, tile, selected, targets, highlight=None):
+    def tile_border(self, tile, selected, targets, highlight=None, steps=()):
         """(colour, width) of the border this tile should have, or None."""
         if tile is selected or tile.coord == highlight:
             return config.SELECTED_COLOUR, config.SELECTED_BORDER_WIDTH
         if tile.coord in targets:
             return config.MOVE_TARGET_COLOUR, config.BORDER_WIDTH
+        if tile.coord in steps:
+            return config.STEP_TARGET_COLOUR, config.STEP_TARGET_WIDTH
         return None
 
     def tile_fill_colour(self, tile, board):
@@ -189,11 +192,12 @@ class Renderer:
         self.screen.blit(text, text.get_rect(midtop=(config.SCREEN_SIZE[0] // 2, config.SCORE_Y)))
 
     def draw_ui(self, game):
-        """Whose turn it is and their action points, then the status message."""
-        label = (f"{config.TEAM_NAMES[game.active_team]}  -  "
-                 f"{game.action_points}/{config.ACTION_POINTS_PER_TURN} AP")
-        text = self.font.render(label, True, config.BLACK)
+        """Whose turn it is, what they have left underneath, then the status message."""
+        text = self.font.render(config.TEAM_NAMES[game.active_team], True, config.BLACK)
         rect = self.screen.blit(text, config.UI_POSITION)
+        budget = f"Actions left: {game.actions_left()}    Steps left: {game.steps_left()}"
+        self.screen.blit(self.button_font.render(budget, True, config.BLACK),
+                         (config.UI_POSITION[0], rect.bottom))
         if game.status:
             status = self.button_font.render(game.status, True, config.BLACK)
             self.screen.blit(status, status.get_rect(midleft=(rect.right + 20, rect.centery)))
@@ -239,7 +243,7 @@ class Renderer:
 
     def draw_action_buttons(self, game):
         for name, rect in action_buttons(game):
-            label = f"{name.capitalize()} ({config.ACTIONS[name]['cost']})"
+            label = name.capitalize()
             self.draw_button(rect, label, *self.button_colours(game, name))
 
     def draw_end_turn_button(self, game, ai_turn=False):
@@ -247,8 +251,8 @@ class Renderer:
             colours = config.BUTTON_DISABLED_COLOUR, config.BUTTON_DISABLED_TEXT_COLOUR
             self.draw_button(end_turn_button(), "AI's turn", *colours)
             return
-        # Highlighted once the team has nothing left to spend
-        if game.action_points == 0:
+        # Highlighted once the team has nothing left to do
+        if game.actions_left() == 0 and game.steps_left() == 0:
             colours = config.BUTTON_ACTIVE_COLOUR, config.BUTTON_ACTIVE_TEXT_COLOUR
         else:
             colours = config.BUTTON_COLOUR, config.BUTTON_TEXT_COLOUR
