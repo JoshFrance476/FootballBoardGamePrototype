@@ -11,12 +11,14 @@ A turn:
     ball picks it up.
   - The team has one action, which any of its players can use.
   - The first time each player gets the ball in a turn, the team earns an
-    extra action, which any of its players can use. Holding it at the start
-    of the turn counts, and so do receiving a pass, a tackle, or picking up a
-    loose ball. Getting it back later in the same turn earns nothing more.
+    extra actions, which any of its players can use: holding it at the start
+    of the turn earns config.START_POSSESSION_ACTIONS, winning it with a
+    tackle config.TACKLE_POSSESSION_ACTIONS, and any other way (receiving a
+    pass, picking up a loose ball) config.RECEIVE_POSSESSION_ACTIONS. Getting it back later in the same turn earns nothing more.
   - Steps and actions can happen in any order. Press End turn when done.
 After a goal, everyone goes back to kick-off positions and the team that
-conceded takes the next turn.
+conceded takes the next turn. Turns always alternate, so a match of
+config.TURNS_PER_TEAM turns each is over after twice that many turns.
 """
 import random
 from typing import NamedTuple, Optional
@@ -48,9 +50,16 @@ class Game:
         self.score = {config.HOME: 0, config.AWAY: 0}
         self.message = ""       # what happened last, shown in the status line
         self.turn_number = 0    # goes up by one every time the turn changes hands
+        self.turn_limit = 2 * config.TURNS_PER_TEAM if config.TURNS_PER_TEAM else None
+        self.over = False       # True once the last turn has been played
         self.start_turn(config.HOME)
 
     def start_turn(self, team):
+        if self.turn_limit is not None and self.turn_number >= self.turn_limit:
+            self.over = True    # full time: no more turns
+            self.selected = None
+            self.action = None
+            return
         self.active_team = team
         self.turn_number += 1
         self.actions_remaining = 1  # actions any player on the team can use this turn
@@ -59,7 +68,8 @@ class Game:
         self.last_actions = {}    # tile coord -> name of the action its player last did this turn
         self.selected = None      # the Tile whose player is selected, or None
         self.action = None        # name of the action awaiting a target click, or None
-        self._check_new_carrier()  # holding the ball at the start of the turn counts
+        # Holding the ball at the start of the turn counts as a first possession
+        self._check_new_carrier(config.START_POSSESSION_ACTIONS)
 
     def clone(self, roll=None):
         """An independent copy for the AI to experiment on.
@@ -73,6 +83,8 @@ class Game:
         copy.score = dict(self.score)
         copy.message = ""
         copy.turn_number = self.turn_number
+        copy.turn_limit = self.turn_limit
+        copy.over = self.over
         copy.active_team = self.active_team
         copy.actions_remaining = self.actions_remaining
         copy.had_ball = set(self.had_ball)
@@ -89,12 +101,12 @@ class Game:
         players = [(tile, tile.player, tile.player.facing)
                    for tile in self.board.tiles.values() if tile.player is not None]
         return (self.board.ball, self.actions_remaining, frozenset(self.had_ball),
-                self.active_team, self.turn_number, dict(self.score), frozenset(self.stepped),
-                dict(self.last_actions), self.message, players)
+                self.active_team, self.turn_number, self.over, dict(self.score),
+                frozenset(self.stepped), dict(self.last_actions), self.message, players)
 
     def restore(self, snapshot):
         """Put the game back exactly as it was when snapshot() was taken."""
-        (ball, actions_remaining, had_ball, team, turn, score, stepped, last_actions,
+        (ball, actions_remaining, had_ball, team, turn, over, score, stepped, last_actions,
          message, players) = snapshot
         for tile in self.board.tiles.values():
             tile.player = None
@@ -106,6 +118,7 @@ class Game:
         self.had_ball = set(had_ball)
         self.active_team = team
         self.turn_number = turn
+        self.over = over
         self.score = dict(score)                # copies: the snapshot may be restored again
         self.stepped = set(stepped)
         self.last_actions = dict(last_actions)
@@ -145,8 +158,25 @@ class Game:
     def steps_left(self):
         return sum(1 for tile in self.own_tiles() if self.can_step(tile))
 
+    def turns_left(self):
+        """Turns still to be played after this one (None with no limit)."""
+        if self.turn_limit is None:
+            return None
+        return max(0, self.turn_limit - self.turn_number)
+
+    def result_text(self):
+        """e.g. "Home win 2 - 1" or "Draw 1 - 1"."""
+        home, away = self.score[config.HOME], self.score[config.AWAY]
+        if home == away:
+            return f"Draw {home} - {away}"
+        winner = config.HOME if home > away else config.AWAY
+        return f"{config.TEAM_NAMES[winner]} win {home} - {away}"
+
     def legal_moves(self):
-        """Every move the team whose turn it is could make right now. End turn is always one."""
+        """Every move the team whose turn it is could make right now. End turn
+        is always one, until the match is over (then there are none)."""
+        if self.over:
+            return []
         moves = [END_TURN]
         for tile in self.own_tiles():
             for coord in self.step_targets(tile):
@@ -174,14 +204,17 @@ class Game:
         self._check_new_carrier()
         return result
 
-    def _check_new_carrier(self):
+    def _check_new_carrier(self, earns=None):
         """If the ball is now with a player of the team to move who hasn't had
-        it yet this turn, earn the team an extra action."""
+        it yet this turn, earn the team `earns` extra actions (by default
+        config.RECEIVE_POSSESSION_ACTIONS)."""
+        if earns is None:
+            earns = config.RECEIVE_POSSESSION_ACTIONS
         carrier = self.board.get(self.board.ball)
         if (carrier.player is not None and carrier.player.team == self.active_team
                 and carrier.coord not in self.had_ball):
             self.had_ball.add(carrier.coord)
-            self.actions_remaining += 1
+            self.actions_remaining += earns
 
     def _step(self, move):
         tile, destination = self.board.get(move.coord), self.board.get(move.target)
@@ -204,8 +237,13 @@ class Game:
         self._player_moved(move.coord, result.tile.coord)
         self.last_actions[result.tile.coord] = move.action
         self.message = result.message
+        if result.tackle_won and result.tile.coord not in self.had_ball:
+            # The tackler's first possession this turn. If the same action
+            # passes the ball on, the receiver still earns one as usual.
+            self.had_ball.add(result.tile.coord)
+            self.actions_remaining += config.TACKLE_POSSESSION_ACTIONS
         if result.goal_for is not None:
-            self.goal_scored(result.goal_for, outcome.shot_chance)
+            self.goal_scored(result.goal_for, outcome.score_chance)
         return result
 
     def _player_moved(self, old, new):
@@ -277,11 +315,14 @@ class Game:
             options = self.options.values()
             parts = []
             tackles = sorted({o.tackle_chance for o in options if o.tackle_from is not None})
-            shots = sorted({o.shot_chance for o in options if o.shot_at is not None})
+            shots = sorted({o.score_chance for o in options if o.shot_at is not None})
+            saves = sorted({o.save_chance for o in options if o.shot_at is not None and o.save_chance})
             if tackles:
                 parts.append("Tackle " + " / ".join(map(percent, tackles)))
             if shots:
                 parts.append("Score " + " / ".join(map(percent, shots)))
+            if saves:
+                parts.append("keeper saves " + " / ".join(map(percent, saves)))
             if parts:
                 return "Chance: " + ", ".join(parts)
         return self.message
@@ -290,6 +331,8 @@ class Game:
 
     def choose_action(self, action_name):
         """Handle a click on an action button."""
+        if self.over:
+            return
         if action_name == self.action:
             self.action = None          # clicking the chosen action again cancels it
         elif self.can_use(action_name):
@@ -297,7 +340,7 @@ class Game:
 
     def click(self, tile):
         """Handle a click on a tile. tile is None for clicks off the board."""
-        if tile is None:
+        if tile is None or self.over:
             return
 
         # Clicked a highlighted tile: carry out the action.

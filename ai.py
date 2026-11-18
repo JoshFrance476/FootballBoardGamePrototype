@@ -24,7 +24,8 @@ import threading
 import time
 
 import config
-from actions import WITH_PLAYER, offset_list, outcomes, path_blocked, shot_chance, tackle_chance
+from actions import (WITH_PLAYER, dice_branches, keeper_save_chance, offset_list, outcomes,
+                     path_blocked, scoring_chance, shot_chance, tackle_chance)
 from game import END_TURN, STEP, Move, other_team
 from hex_math import hex_distance, is_in_front, neighbours
 
@@ -46,7 +47,8 @@ def evaluate(game, team, start_score):
                     nobody, so kicking it away upfield gains nothing. Curved
                     by config.AI_PROGRESS_CURVE: above 1, holding the ball in
                     midfield is worth little and the final third a lot.
-      shot_chance   the shot chance from where the ball is, for whichever
+      shot_chance   the chance a shot from where the ball is goes in (after the
+                    keeper's save chance), for whichever
                     team has it (+ for team, - for the opponent)
       ball_safety   minus the best tackle chance the opponents can set up on
                     their next turn: an opponent already next to the carrier,
@@ -67,8 +69,25 @@ def evaluate(game, team, start_score):
       runs          for the team with the ball: the fraction of the carrier's
                     teammates who are ahead of the ball and unmarked
     """
+    if game.over:
+        return final_value(game, team, start_score)
     weights = config.AI_WEIGHTS
     return sum(weights[name] * amount for name, amount in evaluation_terms(game, team, start_score).items())
+
+
+def final_value(game, team, start_score):
+    """Value of a finished match for team: only the score matters. Each goal
+    of difference since the search started counts AI_WEIGHTS["goal"], plus
+    AI_RESULT_WEIGHT for each step from loss to draw to win (so an equaliser
+    or a winner is worth more than a fourth goal)."""
+    opponent = other_team(team)
+
+    def result(score):
+        return (score[team] > score[opponent]) - (score[team] < score[opponent])
+
+    goals = (game.score[team] - start_score[team]) - (game.score[opponent] - start_score[opponent])
+    return (config.AI_WEIGHTS["goal"] * goals
+            + config.AI_RESULT_WEIGHT * (result(game.score) - result(start_score)))
 
 
 def evaluation_terms(game, team, start_score):
@@ -94,7 +113,7 @@ def evaluation_terms(game, team, start_score):
 
     if carrier is not None:
         terms["progress"] = progress(board, carrier.team) ** config.AI_PROGRESS_CURVE * side
-        terms["shot_chance"] = (shot_chance(board, carrier.team, board.ball) or 0) * side
+        terms["shot_chance"] = scoring_chance(board, carrier.team, board.ball) * side
         if game.active_team != carrier.team:   # the defenders move next: can they tackle?
             terms["ball_safety"] = -tackle_threat(board, carrier_tile) * side
         else:                                   # the carrier's team moves next: can it shoot?
@@ -164,9 +183,18 @@ def shot_threat(board, carrier_tile):
     """Best shot chance the carrier's team can set up next turn: the carrier
     can get up to 1 + carry_range() tiles nearer the goal (free step, then an
     action that moves them with the ball), then shoot. Ignores blockers."""
-    distance = hex_distance(board.ball, board.goal_attacked_by(carrier_tile.player.team))
+    team = carrier_tile.player.team
+    distance = hex_distance(board.ball, board.goal_attacked_by(team))
     closest = max(1, distance - 1 - carry_range())
-    return config.SHOT_CHANCE.get(closest, 0.0)
+    return config.SHOT_CHANCE.get(closest, 0.0) * (1 - keeper_save_chance(board, other_team(team)))
+
+
+def clear_caches():
+    """Forget everything worked out from config.ACTIONS. Call after editing
+    actions while the program is running (the menu's editors do)."""
+    _carry_range_cache.clear()
+    _pass_range_cache.clear()
+    _pure_turn_cache.clear()
 
 
 _carry_range_cache = {}
@@ -494,14 +522,7 @@ def expected_value(game, move, team):
     if deterministic(move):
         return value_with([])
     outcome = outcomes(game.board, game.board.get(move.coord), move.action)[move.target]
-    WIN, LOSE = 0.0, 0.999999           # rolls that make a chance succeed / fail
-    tackle = outcome.tackle_chance if outcome.tackle_from is not None else None
-    shot = outcome.shot_chance if outcome.shot_at is not None else None
-    if tackle is not None and shot is not None:
-        return (tackle * shot * value_with([WIN, WIN]) + tackle * (1 - shot) * value_with([WIN, LOSE])
-                + (1 - tackle) * value_with([LOSE]))
-    chance = tackle if tackle is not None else shot
-    return chance * value_with([WIN]) + (1 - chance) * value_with([LOSE])
+    return sum(p * value_with(rolls) for p, rolls in dice_branches(outcome))
 
 
 def widened(node):
@@ -611,7 +632,7 @@ def search(game, seconds=None, max_iterations=None, rng=None, root=None):
             sim.perform(move)
 
         # Selection and expansion
-        while sim.turn_number < horizon:
+        while not sim.over and sim.turn_number < horizon:
             if node.legal is not None:
                 legal = node.legal
             else:
@@ -640,7 +661,7 @@ def search(game, seconds=None, max_iterations=None, rng=None, root=None):
             play(node.move)
 
         # Playout
-        while sim.turn_number < horizon:
+        while not sim.over and sim.turn_number < horizon:
             play(playout_move(sim, rng), charge=False)
 
         # Backpropagation
@@ -697,7 +718,7 @@ class AIController:
 
     def update(self, game):
         """Call once per frame. Advances the AI if it's a computer team's turn."""
-        if not self.controls(game.active_team):
+        if game.over or not self.controls(game.active_team):
             return
 
         # A chosen move has been on show long enough: play it

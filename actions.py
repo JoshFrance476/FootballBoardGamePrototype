@@ -8,8 +8,9 @@ which happen in this order:
                                    to go wherever the player moves; only
                                    applies if the player has the ball)
   - turning round      ("turn": True)  flip the player to face the other way,
-                        after any movement. Actions never change a player's
-                        facing otherwise.
+                        after any movement; or ("face_movement": True) face
+                        the side they moved towards, like the free step.
+                        Actions never change a player's facing otherwise.
   - shooting            ("shoot":  True)  shoot at the goal the team attacks
 
 Offsets are written for a player facing right, measured from where the
@@ -35,8 +36,8 @@ from itertools import product
 from typing import Optional
 
 import config
-from hex_math import (flipped, hex_distance, is_in_front, neighbours, offset_for_facing,
-                      rectangle_coords, tiles_between)
+from hex_math import (facing_after_move, flipped, hex_distance, is_in_front, neighbours,
+                      offset_for_facing, rectangle_coords, tiles_between)
 
 
 # --- Requirements ---
@@ -45,6 +46,8 @@ from hex_math import (flipped, hex_distance, is_in_front, neighbours, offset_for
 REQUIREMENTS = {
     "possession": lambda board, tile: board.has_possession(tile),
     "no_possession": lambda board, tile: not board.has_possession(tile),
+    "goalkeeper": lambda board, tile: tile.player.is_keeper,
+    "in_own_box": lambda board, tile: board.in_box(tile.coord, tile.player.team),
 }
 
 # "ball": WITH_PLAYER means the ball ends up wherever the player moves to,
@@ -65,7 +68,14 @@ class Outcome:
     tackle_from: Optional[tuple] = None  # ball carrier's coordinate, if this tackles
     tackle_chance: float = 1.0
     shot_at: Optional[tuple] = None      # goal coordinate, if this shoots
-    shot_chance: float = 1.0
+    shot_chance: float = 1.0             # chance the shot is on target (beats everything but the keeper)
+    save_chance: float = 0.0             # chance the defending keeper saves an on-target shot
+    keeper_at: Optional[tuple] = None    # where that keeper stands (they catch a save)
+
+    @property
+    def score_chance(self):
+        """Chance the shot goes in: on target and not saved."""
+        return self.shot_chance * (1 - self.save_chance)
 
 
 @dataclass
@@ -74,6 +84,7 @@ class Result:
     tile: object                     # the Tile the acting player is on afterwards
     message: str = ""                # what to tell the player, "" for nothing
     goal_for: Optional[int] = None   # the team that scored, if a goal went in
+    tackle_won: bool = False         # the action included a successful tackle
 
 
 def percent(chance):
@@ -130,8 +141,27 @@ def tackle_chance(carrier, tackler):
     return config.TACKLE_CHANCE[side]
 
 
+def keeper_save_chance(board, defending_team):
+    """Chance the defending team's keeper saves an on-target shot, from
+    KEEPER_SAVE_CHANCE by their distance from goal. 0 with no keeper, or a
+    keeper outside their box (saves are a goalkeeping action)."""
+    keeper = board.keeper_tile(defending_team)
+    if keeper is None or not board.in_box(keeper.coord, defending_team):
+        return 0.0
+    return config.KEEPER_SAVE_CHANCE.get(hex_distance(keeper.coord, board.own_goal(defending_team)), 0.0)
+
+
+def scoring_chance(board, team, coord):
+    """Chance a shot from coord actually goes in: on target and not saved.
+    0 if it's too far to shoot."""
+    chance = shot_chance(board, team, coord) or 0.0
+    defending = config.AWAY if team == config.HOME else config.HOME
+    return chance * (1 - keeper_save_chance(board, defending))
+
+
 def shot_chance(board, team, coord):
-    """Chance of scoring from coord, or None if it's too far to shoot."""
+    """Chance a shot from coord is on target (before the keeper), or None if
+    it's too far to shoot."""
     distance = hex_distance(coord, board.goal_attacked_by(team))
     return config.SHOT_CHANCE.get(distance)
 
@@ -197,11 +227,18 @@ def outcomes(board, tile, action_name):
         elif choice == "ball":
             choice = None           # without the ball there's nothing to choose
 
-    # Actions keep the player's facing unless they say to turn round
-    facing = flipped(player.facing) if action.get("turn") else player.facing
+    # Actions keep the player's facing unless they say to turn round, or to
+    # face the way they moved
+    def facing_at(player_to):
+        if action.get("turn"):
+            return flipped(player.facing)
+        if action.get("face_movement"):
+            return facing_after_move(tile.coord, player_to, player.facing)
+        return player.facing
 
     options = {}
     for player_to, ball_to in product(player_tos, ball_tos):
+        facing = facing_at(player_to)
         if follows:
             ball_to = player_to     # its path is the player's, already checked for blockers
         shot_at, s_chance = None, 1.0
@@ -213,8 +250,14 @@ def outcomes(board, tile, action_name):
             if s_chance is None:
                 continue
             shot_at = board.goal_attacked_by(player.team)
+        save, keeper_at = 0.0, None
+        if shot_at is not None:
+            defending = config.AWAY if player.team == config.HOME else config.HOME
+            save = keeper_save_chance(board, defending)
+            keeper_at = board.keeper_tile(defending).coord if save > 0 else None
 
-        outcome = Outcome(player_to, facing, ball_to, tackle_from, t_chance, shot_at, s_chance)
+        outcome = Outcome(player_to, facing, ball_to, tackle_from, t_chance, shot_at, s_chance,
+                          save, keeper_at)
         if not changes_something(tile, outcome):
             continue
         target = click_target(board, tile, outcome, choice)
@@ -264,6 +307,7 @@ def apply_outcome(board, tile, outcome, roll=random.random):
         if roll() >= outcome.tackle_chance:
             return Result(tile, f"Tackle failed ({percent(outcome.tackle_chance)})")
         messages.append(f"Tackle won ({percent(outcome.tackle_chance)})")
+    tackle_won = outcome.tackle_from is not None
 
     if outcome.ball_to is not None:
         board.ball = outcome.ball_to
@@ -273,18 +317,51 @@ def apply_outcome(board, tile, outcome, roll=random.random):
     destination.player.facing = outcome.facing
 
     if outcome.shot_at is not None:
-        board.ball = outcome.shot_at    # in the net, or loose on the goal tile if missed
-        if roll() < outcome.shot_chance:
-            messages.append(f"Goal! ({percent(outcome.shot_chance)})")
-            return Result(destination, " - ".join(messages), goal_for=destination.player.team)
-        messages.append(f"Shot missed ({percent(outcome.shot_chance)})")
+        if roll() >= outcome.shot_chance:
+            board.ball = outcome.shot_at        # missed: loose on the goal tile
+            messages.append(f"Shot missed ({percent(outcome.shot_chance)} on target)")
+        elif outcome.save_chance > 0 and roll() < outcome.save_chance:
+            board.ball = outcome.keeper_at      # saved: the keeper catches it
+            messages.append(f"Saved by the keeper ({percent(outcome.save_chance)} save chance)")
+        else:
+            board.ball = outcome.shot_at
+            messages.append(f"Goal! ({percent(outcome.score_chance)} chance)")
+            return Result(destination, " - ".join(messages), goal_for=destination.player.team,
+                          tackle_won=tackle_won)
 
-    return Result(destination, " - ".join(messages))
+    return Result(destination, " - ".join(messages), tackle_won=tackle_won)
+
+
+WIN, LOSE = 0.0, 0.999999   # dice rolls that make a chance succeed / fail
+
+
+def dice_branches(outcome):
+    """[(probability, rolls)] for every way an outcome's dice can fall, in the
+    order apply_outcome rolls them: tackle (failing stops the action), shot
+    on target, then the keeper's save. Pass the rolls (via a scripted roll
+    function) to reproduce that branch exactly."""
+    branches = [(1.0, [])]
+    if outcome.tackle_from is not None:
+        p = outcome.tackle_chance
+        failed = [(q * (1 - p), rolls + [LOSE]) for q, rolls in branches]
+        branches = [(q * p, rolls + [WIN]) for q, rolls in branches]
+    else:
+        failed = []
+    if outcome.shot_at is not None:
+        p, save = outcome.shot_chance, outcome.save_chance
+        result = [(q * (1 - p), rolls + [LOSE]) for q, rolls in branches]              # miss
+        if save > 0:
+            result += [(q * p * save, rolls + [WIN, WIN]) for q, rolls in branches]      # saved
+            result += [(q * p * (1 - save), rolls + [WIN, LOSE]) for q, rolls in branches]  # goal
+        else:
+            result += [(q * p, rolls + [WIN]) for q, rolls in branches]                  # goal
+        branches = result
+    return [(q, rolls) for q, rolls in branches + failed if q > 0]
 
 
 # --- Config checking ---
 
-ACTION_KEYS = {"requires", "tackle", "self", "ball", "lofted", "turn", "shoot"}
+ACTION_KEYS = {"requires", "tackle", "self", "ball", "lofted", "turn", "face_movement", "shoot"}
 EFFECT_KEYS = ("tackle", "self", "ball", "turn", "shoot")
 
 
@@ -294,9 +371,9 @@ def validate_config():
         return (isinstance(value, tuple) and len(value) == 2
                 and all(isinstance(n, int) for n in value))
 
-    def is_offsets(value):
+    def is_offsets(value, allow_empty=False):
         if isinstance(value, list):
-            return len(value) > 0 and all(is_offset(o) for o in value)
+            return (allow_empty or len(value) > 0) and all(is_offset(o) for o in value)
         return is_offset(value)
 
     def is_chance(value):
@@ -323,7 +400,7 @@ def validate_config():
             if "self" not in action:
                 raise ValueError(f"{where} has \"ball\": \"with_player\" but no 'self' "
                                  f"for the player to move to")
-        elif "ball" in action and not is_offsets(action["ball"]):
+        elif "ball" in action and not is_offsets(action["ball"], allow_empty=True):
             raise ValueError(f"{where}['ball'] must be an offset like (1, 0), a list of "
                              f"them like [(1, 0), (0, 1)], or \"with_player\"")
         if "self" in action and not is_offsets(action["self"]):
@@ -337,10 +414,14 @@ def validate_config():
         if len(choices) > 1:
             raise ValueError(f"{where} offers more than one choice ({', '.join(choices)}); "
                              f"only one of a 'self' list or a 'ball' list is allowed")
-        for key in ("tackle", "shoot", "lofted", "turn"):
+        if action.get("turn") and action.get("face_movement"):
+            raise ValueError(f"{where} has both 'turn' and 'face_movement'; pick one")
+        for key in ("tackle", "shoot", "lofted", "turn", "face_movement"):
             if key in action and not isinstance(action[key], bool):
                 raise ValueError(f"{where}[{key!r}] must be True or False")
-        if not any(action.get(key) for key in EFFECT_KEYS):
+        if action.get("ball") == []:
+            print(f"Note: config.ACTIONS[{name!r}] has no 'ball' locations yet, so it can't be used.")
+        elif not any(action.get(key) for key in EFFECT_KEYS):
             raise ValueError(f"{where} doesn't do anything: give it one of {list(EFFECT_KEYS)}")
 
     if set(config.TACKLE_CHANCE) != set(TACKLE_ANGLES):
@@ -350,6 +431,13 @@ def validate_config():
             if not is_chance(value):
                 raise ValueError(f"config.{table}[{key!r}] must be a chance from 0 to 1")
 
+    for name in ("START_POSSESSION_ACTIONS", "TACKLE_POSSESSION_ACTIONS",
+                 "RECEIVE_POSSESSION_ACTIONS"):
+        value = getattr(config, name)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ValueError(f"config.{name} must be a whole number, 0 or more")
+    if not isinstance(config.TURNS_PER_TEAM, int) or config.TURNS_PER_TEAM < 0:
+        raise ValueError("config.TURNS_PER_TEAM must be a whole number (0 = no limit)")
     if config.AI_ENGINE not in ("planner", "mcts"):
         raise ValueError("config.AI_ENGINE must be 'planner' or 'mcts'")
     for team, controller in config.CONTROLLERS.items():
@@ -368,6 +456,19 @@ def validate_config():
             if "facing" in entry and entry["facing"] not in (config.RIGHT, config.LEFT):
                 raise ValueError(f"A player at {entry['position']} has facing {entry['facing']!r}; "
                                  f"it must be RIGHT or LEFT")
+
+    for team, entries in config.INITIAL_SETUP.items():
+        if not entries:
+            raise ValueError(f"{config.TEAM_NAMES[team]} has no players")
+        roles = [entry.get("role", "outfield") for entry in entries]
+        for role in roles:
+            if role not in ("outfield", "goalkeeper"):
+                raise ValueError(f"Unknown role {role!r}: use 'outfield' or 'goalkeeper'")
+        if roles.count("goalkeeper") > 1:
+            raise ValueError(f"{config.TEAM_NAMES[team]} has more than one goalkeeper")
+    for key, value in config.KEEPER_SAVE_CHANCE.items():
+        if not isinstance(key, int) or not is_chance(value):
+            raise ValueError(f"config.KEEPER_SAVE_CHANCE[{key!r}] must map a distance to a chance from 0 to 1")
 
     board_coords = set(rectangle_coords(config.BOARD_COLS, config.BOARD_ROWS))
     taken = {}

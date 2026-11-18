@@ -5,21 +5,68 @@ import pygame
 
 import config
 from hex_math import (DIRECTIONS, SQRT3, hex_corners, hex_to_pixel, pixel_to_hex,
-                      point_in_hex)
+                      point_in_hex, rectangle_coords)
 
 
 # --- Layout ---
 
+_layout_cache = {}
+
+
+def layout():
+    """(hex size, gap, origin) that fit the pitch between the score and the UI.
+
+    Hexes are config.HEX_SIZE when the pitch fits at that size, and shrink
+    (gap and markers too) for bigger pitches. The pitch is centred.
+    """
+    key = (config.BOARD_COLS, config.BOARD_ROWS, config.HEX_SIZE, config.HEX_GAP,
+           config.SCREEN_SIZE, config.UI_POSITION, config.SCORE_Y)
+    if key not in _layout_cache:
+        coords = rectangle_coords(config.BOARD_COLS, config.BOARD_ROWS)
+        size, gap = config.HEX_SIZE, config.HEX_GAP
+        points = [hex_to_pixel(q, r, size, gap) for q, r in coords]
+        half_width, half_height = size * SQRT3 / 2, size
+        left = min(x for x, _ in points) - half_width
+        right = max(x for x, _ in points) + half_width
+        top = min(y for _, y in points) - half_height
+        bottom = max(y for _, y in points) + half_height
+        area_top = config.SCORE_Y + 22
+        area_bottom = config.UI_POSITION[1] - 2
+        area_width = config.SCREEN_SIZE[0] - 20
+        scale = min(1.0, area_width / (right - left), (area_bottom - area_top) / (bottom - top))
+        size, gap = size * scale, gap * scale
+        origin = (config.SCREEN_SIZE[0] / 2 - (left + right) / 2 * scale,
+                  (area_top + area_bottom) / 2 - (top + bottom) / 2 * scale)
+        _layout_cache[key] = (size, gap, origin)
+    return _layout_cache[key]
+
+
+def hex_size():
+    return layout()[0]
+
+
+def scaled(pixels):
+    """A marker size from config, shrunk along with the hexes."""
+    return max(1, round(pixels * hex_size() / config.HEX_SIZE))
+
+
 def tile_centre(q, r):
-    """Pixel centre of a board tile, using this game's layout settings."""
-    return hex_to_pixel(q, r, config.HEX_SIZE, config.HEX_GAP, config.ORIGIN)
+    """Pixel centre of a board tile."""
+    size, gap, origin = layout()
+    return hex_to_pixel(q, r, size, gap, origin)
+
+
+def coord_at_pixel(pos):
+    """The axial coordinate under a screen position (may be off the board)."""
+    size, gap, origin = layout()
+    return pixel_to_hex(*pos, size, gap, origin)
 
 
 def tile_at_pixel(pos, board):
     """The Tile under a screen position, or None if off the board or in a gap."""
-    coord = pixel_to_hex(*pos, config.HEX_SIZE, config.HEX_GAP, config.ORIGIN)
+    coord = coord_at_pixel(pos)
     tile = board.get(coord)
-    if tile is None or not point_in_hex(pos, tile_centre(*coord), config.HEX_SIZE):
+    if tile is None or not point_in_hex(pos, tile_centre(*coord), hex_size()):
         return None
     return tile
 
@@ -54,6 +101,36 @@ def end_turn_button():
     width, height = config.BUTTON_SIZE
     x = config.SCREEN_SIZE[0] - config.BUTTON_MARGIN - width
     return pygame.Rect(x, config.UI_POSITION[1], width, height)
+
+
+def full_time_panel():
+    """pygame.Rect of the full-time box, centred on the screen."""
+    width, height = config.FULL_TIME_PANEL_SIZE
+    rect = pygame.Rect(0, 0, width, height)
+    rect.center = (config.SCREEN_SIZE[0] // 2, config.SCREEN_SIZE[1] // 2)
+    return rect
+
+
+FULL_TIME_CHOICES = ["play again", "main menu", "quit"]
+
+
+def full_time_buttons():
+    """{choice: Rect} side by side along the bottom of the full-time box."""
+    panel = full_time_panel()
+    width, height = config.BUTTON_SIZE
+    gap = config.BUTTON_GAP * 2
+    total = len(FULL_TIME_CHOICES) * width + (len(FULL_TIME_CHOICES) - 1) * gap
+    y = panel.bottom - height - 20
+    return {name: pygame.Rect(panel.centerx - total // 2 + i * (width + gap), y, width, height)
+            for i, name in enumerate(FULL_TIME_CHOICES)}
+
+
+def full_time_button_at_pixel(pos):
+    """"play again", "main menu", "quit" or None."""
+    for name, rect in full_time_buttons().items():
+        if rect.collidepoint(pos):
+            return name
+    return None
 
 
 def action_at_pixel(pos, game):
@@ -108,6 +185,8 @@ class Renderer:
         self.draw_ui(game)
         self.draw_action_buttons(game)
         self.draw_end_turn_button(game, ai_turn)
+        if game.over:
+            self.draw_full_time(game)
 
     # --- Board ---
 
@@ -123,21 +202,24 @@ class Renderer:
 
     def tile_fill_colour(self, tile, board):
         if tile.player is not None:
-            return config.TEAM_COLOURS[tile.player.team]
+            colours = config.KEEPER_COLOURS if tile.player.is_keeper else config.TEAM_COLOURS
+            return colours[tile.player.team]
         side = board.goal_side(tile.coord)
         if side is not None:
             return config.GOAL_COLOURS[side]
+        if board.in_box(tile.coord, config.HOME) or board.in_box(tile.coord, config.AWAY):
+            return config.BOX_COLOUR
         return config.PITCH_GREEN
 
     def draw_tile(self, tile, border, board):
         centre = tile_centre(tile.q, tile.r)
         colour = self.tile_fill_colour(tile, board)
         if border is None:
-            draw_hexagon(self.screen, colour, centre, config.HEX_SIZE)
+            draw_hexagon(self.screen, colour, centre, hex_size())
         else:
             border_colour, border_width = border
             draw_bordered_hexagon(self.screen, colour, border_colour,
-                                  centre, config.HEX_SIZE, border_width)
+                                  centre, hex_size(), scaled(border_width))
         if tile.player is not None:
             self.draw_facing(centre, tile.player.facing)
 
@@ -149,15 +231,15 @@ class Renderer:
         ux, uy = dx / length, dy / length
         px, py = -uy, ux                       # perpendicular, for the back edge
         cx, cy = centre
-        tip = (cx + ux * config.FACING_TIP, cy + uy * config.FACING_TIP)
-        bx, by = cx + ux * config.FACING_BASE, cy + uy * config.FACING_BASE
-        w = config.FACING_HALF_WIDTH
+        tip = (cx + ux * scaled(config.FACING_TIP), cy + uy * scaled(config.FACING_TIP))
+        bx, by = cx + ux * scaled(config.FACING_BASE), cy + uy * scaled(config.FACING_BASE)
+        w = scaled(config.FACING_HALF_WIDTH)
         pygame.draw.polygon(self.screen, colour,
                             [tip, (bx + px * w, by + py * w), (bx - px * w, by - py * w)])
 
     def draw_ball(self, coord):
         pygame.draw.circle(self.screen, config.BALL_COLOUR, tile_centre(*coord),
-                           config.BALL_RADIUS)
+                           scaled(config.BALL_RADIUS))
 
     def draw_player_previews(self, game):
         """Outline, in the team's colour, where the chosen action would move the
@@ -171,7 +253,7 @@ class Renderer:
                 facings.setdefault(outcome.player_to, set()).add(outcome.facing)
         for coord, directions in facings.items():
             centre = tile_centre(*coord)
-            inner = config.HEX_SIZE - config.PREVIEW_PLAYER_INSET
+            inner = hex_size() - scaled(config.PREVIEW_PLAYER_INSET)
             pygame.draw.polygon(self.screen, colour, hex_corners(centre, inner),
                                 config.PREVIEW_PLAYER_WIDTH)
             if len(directions) == 1:
@@ -181,7 +263,7 @@ class Renderer:
         """Outline where the chosen action would send the ball."""
         for coord in {o.ball_to for o in game.options.values() if o.ball_to is not None}:
             pygame.draw.circle(self.screen, config.BALL_COLOUR, tile_centre(*coord),
-                               config.BALL_RADIUS, config.PREVIEW_BALL_WIDTH)
+                               scaled(config.BALL_RADIUS), config.PREVIEW_BALL_WIDTH)
 
     # --- UI ---
 
@@ -189,10 +271,31 @@ class Renderer:
         label = (f"{config.TEAM_NAMES[config.HOME]}  {game.score[config.HOME]}"
                  f"  -  {game.score[config.AWAY]}  {config.TEAM_NAMES[config.AWAY]}")
         text = self.button_font.render(label, True, config.BLACK)
-        self.screen.blit(text, text.get_rect(midtop=(config.SCREEN_SIZE[0] // 2, config.SCORE_Y)))
+        rect = self.screen.blit(text, text.get_rect(midtop=(config.SCREEN_SIZE[0] // 2, config.SCORE_Y)))
+        if game.turn_limit is not None:
+            clock = "Full time" if game.over else f"Turn {game.turn_number} of {game.turn_limit}"
+            text = self.button_font.render(clock, True, config.BLACK)
+            self.screen.blit(text, text.get_rect(topright=(config.SCREEN_SIZE[0] - 10, config.SCORE_Y)))
+
+    def draw_full_time(self, game):
+        """Dim the screen and show the result with Play again / Quit buttons."""
+        shade = pygame.Surface(config.SCREEN_SIZE, pygame.SRCALPHA)
+        shade.fill(config.FULL_TIME_SHADE)
+        self.screen.blit(shade, (0, 0))
+        panel = full_time_panel()
+        pygame.draw.rect(self.screen, config.FULL_TIME_PANEL_COLOUR, panel,
+                         border_radius=config.BUTTON_RADIUS * 2)
+        title = self.font.render("Full time", True, config.BLACK)
+        self.screen.blit(title, title.get_rect(midtop=(panel.centerx, panel.top + 20)))
+        result = self.button_font.render(game.result_text(), True, config.BLACK)
+        self.screen.blit(result, result.get_rect(midtop=(panel.centerx, panel.top + 60)))
+        for name, rect in full_time_buttons().items():
+            self.draw_button(rect, name.capitalize(), config.BUTTON_COLOUR, config.BUTTON_TEXT_COLOUR)
 
     def draw_ui(self, game):
         """Whose turn it is, what they have left underneath, then the status message."""
+        if game.over:
+            return
         text = self.font.render(config.TEAM_NAMES[game.active_team], True, config.BLACK)
         rect = self.screen.blit(text, config.UI_POSITION)
         budget = f"Actions left: {game.actions_left()}    Steps left: {game.steps_left()}"
@@ -247,6 +350,10 @@ class Renderer:
             self.draw_button(rect, label, *self.button_colours(game, name))
 
     def draw_end_turn_button(self, game, ai_turn=False):
+        if game.over:
+            colours = config.BUTTON_DISABLED_COLOUR, config.BUTTON_DISABLED_TEXT_COLOUR
+            self.draw_button(end_turn_button(), "Full time", *colours)
+            return
         if ai_turn:
             colours = config.BUTTON_DISABLED_COLOUR, config.BUTTON_DISABLED_TEXT_COLOUR
             self.draw_button(end_turn_button(), "AI's turn", *colours)

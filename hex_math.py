@@ -17,11 +17,14 @@ def rectangle_coords(cols, rows):
 
     In axial coordinates a straight column leans diagonally, so each pair of
     rows shifts the q range left by one to keep the board rectangular.
+    Odd rows sit half a tile to the right, so they get one tile fewer: then
+    both side edges zigzag the same way and the board is an exact mirror
+    image left-to-right.
     """
     coords = []
     for r in range(rows):
         r_offset = r // 2
-        for q in range(-r_offset, cols - r_offset):
+        for q in range(-r_offset, cols - r_offset - r % 2):
             coords.append((q, r))
     return coords
 

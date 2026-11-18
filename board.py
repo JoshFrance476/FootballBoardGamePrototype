@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 import config
-from hex_math import rectangle_coords
+from hex_math import hex_distance, rectangle_coords
 from player import Player
 
 
@@ -37,7 +37,8 @@ class Board:
         copy.tiles = {
             coord: Tile(tile.q, tile.r,
                         None if tile.player is None else
-                        Player(tile.player.team, tile.player.actions, tile.player.facing))
+                        Player(tile.player.team, tile.player.actions, tile.player.facing,
+                               tile.player.role))
             for coord, tile in self.tiles.items()
         }
         copy.goals = self.goals     # never changes, so it can be shared
@@ -52,13 +53,15 @@ class Board:
         self.place_players(config.INITIAL_SETUP)
 
     def place_players(self, setup):
-        """Put players on the board from a {team: [{"actions", "position"}, ...]} dict."""
+        """Put players on the board from a {team: [{"actions", "position"}, ...]} dict.
+        An entry can also give "facing" and "role" ("goalkeeper")."""
         for team, entries in setup.items():
             for entry in entries:
                 actions = list(entry["actions"])
                 actions += [a for a in config.DEFAULT_ACTIONS if a not in actions]
                 facing = entry.get("facing", config.TEAM_FACING[team])
-                self.tiles[entry["position"]].player = Player(team, actions, facing)
+                role = entry.get("role", "outfield")
+                self.tiles[entry["position"]].player = Player(team, actions, facing, role)
 
     # --- Lookup ---
 
@@ -79,6 +82,22 @@ class Board:
     def goal_attacked_by(self, team):
         """Coordinate of the goal this team shoots at."""
         return self.goals[config.ATTACKING_GOAL[team]]
+
+    def own_goal(self, team):
+        """Coordinate of the goal this team defends."""
+        other = config.AWAY if team == config.HOME else config.HOME
+        return self.goal_attacked_by(other)
+
+    def in_box(self, coord, team):
+        """True if coord is in this team's box: within KEEPER_BOX_RADIUS of its goal."""
+        return hex_distance(coord, self.own_goal(team)) <= config.KEEPER_BOX_RADIUS
+
+    def keeper_tile(self, team):
+        """The tile of this team's goalkeeper, or None if it has none."""
+        for tile in self.tiles.values():
+            if tile.player is not None and tile.player.team == team and tile.player.is_keeper:
+                return tile
+        return None
 
     def goal_side(self, coord):
         """"left" or "right" if coord is a goal tile, otherwise None."""

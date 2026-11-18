@@ -26,11 +26,10 @@ import math
 import time
 
 import config
-from actions import outcomes
+from actions import dice_branches, outcomes
 from ai import action_charge, deterministic, evaluate, positioning_step, search_moves
 from game import END_TURN, other_team
 
-WIN, LOSE = 0.0, 0.999999       # dice rolls that make a chance succeed / fail
 MAX_TURN_MOVES = 12             # safety limit on searched moves in one turn
 
 
@@ -41,7 +40,7 @@ def signature(game):
     the same position (e.g. the same moves in another order) count once."""
     players = frozenset((tile.coord, tile.player.team, tile.player.facing)
                         for tile in game.board.tiles.values() if tile.player is not None)
-    return (game.turn_number, game.active_team, game.board.ball, game.actions_remaining,
+    return (game.turn_number, game.over, game.active_team, game.board.ball, game.actions_remaining,
             players, frozenset(game.stepped), frozenset(game.had_ball), tuple(sorted(game.score.items())))
 
 
@@ -56,14 +55,10 @@ def after(game, move, rolls=None):
 
 
 def dice_results(game, move):
-    """[(probability, rolls)] for each way a tackle/shot move can turn out."""
+    """[(probability, rolls)] for each way a tackle/shot move can turn out
+    (including the keeper's save roll)."""
     outcome = outcomes(game.board, game.board.get(move.coord), move.action)[move.target]
-    tackle = outcome.tackle_chance if outcome.tackle_from is not None else None
-    shot = outcome.shot_chance if outcome.shot_at is not None else None
-    if tackle is not None and shot is not None:
-        return [(tackle * shot, [WIN, WIN]), (tackle * (1 - shot), [WIN, LOSE]), (1 - tackle, [LOSE])]
-    chance = tackle if tackle is not None else shot
-    return [(chance, [WIN]), (1 - chance, [LOSE])]
+    return dice_branches(outcome)
 
 
 def finish_with_positioning(game):
@@ -102,6 +97,8 @@ def finish_turn_greedily(game, team, start_score, depth=0):
     """[(probability, end position)] for the rest of the current team's turn,
     picking the best quick_value move each time and following every dice
     result. Ends with positioning and End turn."""
+    if game.over:
+        return [(1.0, game)]
     if depth >= MAX_TURN_MOVES:
         return [(1.0, ended(game)[0])]
     moves = search_moves(game)
@@ -113,7 +110,7 @@ def finish_turn_greedily(game, team, start_score, depth=0):
     results = []
     for p, rolls in dice_results(game, best):
         state = after(game, best, rolls)
-        if state.active_team != game.active_team:           # a goal: the turn is over
+        if state.over or state.active_team != game.active_team:   # a goal: the turn is over
             results.append((p, state))
         else:
             results.extend((p * q, s) for q, s in
@@ -141,7 +138,7 @@ class TurnPlan:
         results = []
         for p, rolls in dice_results(self.chance_state, dice_move):
             state = after(self.chance_state, dice_move, rolls)
-            if state.active_team != self.chance_state.active_team:   # scored: turn over
+            if state.over or state.active_team != self.chance_state.active_team:   # scored: turn over
                 results.append((p, state))
             else:
                 results.extend((p * q, s) for q, s in finish_turn_greedily(state, team, start_score))
@@ -193,7 +190,7 @@ def candidate_turns(game, width, count, deadline):
 def reply_value(position, team, start_score, deadline):
     """Value for team of `position` (the other team to move), assuming the
     other team plays its best reply turn. Dice are averaged."""
-    if position.active_team == team:     # e.g. the game moved on after a goal
+    if position.over or position.active_team == team:   # full time, or the game moved on
         return evaluate(position, team, start_score)
     replies = candidate_turns(position, config.AI_REPLY_WIDTH, config.AI_REPLIES_CHECKED, deadline)
     if not replies:
@@ -243,6 +240,8 @@ class TurnPlayer:
         self.last_info = {}
 
     def next_move(self, game, seconds=None):
+        if game.over:
+            return END_TURN
         if self.queue and self.queue[0][0] == signature(game):
             return self.queue.pop(0)[1]
         moves, self.last_info = best_turn(game, seconds)
