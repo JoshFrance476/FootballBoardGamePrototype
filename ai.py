@@ -922,7 +922,8 @@ class AIController:
     chosen tile marked - before being played.
     """
 
-    def __init__(self, seed=config.AI_SEED):
+    def __init__(self, seed=config.AI_SEED, controllers=None):
+        self.controllers = controllers  # {team: "human" or "ai"}; None = config.CONTROLLERS
         self.rng = random.Random(seed)
         self.thread = None
         self.result = None
@@ -933,9 +934,8 @@ class AIController:
         self.turn_player = None   # planner.TurnPlayer, when config.AI_ENGINE is "planner"
         self.verbose = config.AI_DEBUG
 
-    @staticmethod
-    def controls(team):
-        return config.CONTROLLERS[team] == "ai"
+    def controls(self, team):
+        return (self.controllers or config.CONTROLLERS)[team] == "ai"
 
     @property
     def highlight(self):

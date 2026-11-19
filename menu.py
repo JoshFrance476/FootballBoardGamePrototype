@@ -13,14 +13,15 @@ import pygame
 
 import actions as actions_module
 import config
+import ranking as ranking_module
 import settings
 import ui
 from ai import AIController
 from board import Board
 from game import Game
 from hex_math import RIGHT, LEFT, SQRT3, hex_corners, hex_to_pixel, pixel_to_hex, point_in_hex
-from render import (action_at_pixel, end_turn_button, full_time_button_at_pixel, tile_at_pixel,
-                    tile_centre, hex_size)
+from render import (FULL_TIME_CHOICES, action_at_pixel, end_turn_button, full_time_button_at_pixel,
+                    tile_at_pixel, tile_centre, hex_size)
 
 WIDTH, HEIGHT = config.SCREEN_SIZE
 BACK_RECT = (20, HEIGHT - 56, 120, 40)
@@ -108,23 +109,24 @@ class MainMenu(Screen):
         super().__init__(app)
         self.message = ""
         self.error, self.notes = None, []
-        w, h, gap = 280, 40, 8
-        x, y = (WIDTH - w) // 2, 90
+        w, h, gap = 280, 36, 6
+        x, y = (WIDTH - w) // 2, 84
 
         def row(i):
             return (x, y + i * (h + gap), w, h)
 
         self.widgets = [
             ui.Button(row(0), "Play", self.play, enabled=lambda: self.error is None),
-            ui.Button(row(1), "Match settings", lambda: app.push(MatchScreen(app))),
-            ui.Button(row(2), "Pitch and rules", lambda: app.push(RulesScreen(app))),
-            ui.Button(row(3), "Formation", lambda: app.push(FormationScreen(app))),
-            ui.Button(row(4), "Actions", lambda: app.push(ActionsScreen(app))),
-            ui.Button(row(5), "Save to config.py", self.save,
+            ui.Button(row(1), "Rankings", lambda: app.push(RankingsScreen(app))),
+            ui.Button(row(2), "Match settings", lambda: app.push(MatchScreen(app))),
+            ui.Button(row(3), "Pitch and rules", lambda: app.push(RulesScreen(app))),
+            ui.Button(row(4), "Formation", lambda: app.push(FormationScreen(app))),
+            ui.Button(row(5), "Actions", lambda: app.push(ActionsScreen(app))),
+            ui.Button(row(6), "Save to config.py", self.save,
                       enabled=lambda: self.error is None and settings.has_unsaved_changes()),
-            Confirm(row(6), "Revert to config.py", "Click again to revert", self.revert,
+            Confirm(row(7), "Revert to config.py", "Click again to revert", self.revert,
                     enabled=settings.has_unsaved_changes),
-            ui.Button(row(7), "Quit", app.quit),
+            ui.Button(row(8), "Quit", app.quit),
         ]
 
     def back(self):
@@ -874,6 +876,8 @@ class ActionsScreen(Screen):
 # --- The match ---
 
 class GameScreen(Screen):
+    leave_label = "Main menu"       # the pause menu's button for leaving the match
+
     def __init__(self, app):
         super().__init__(app)
         self.restart()
@@ -881,6 +885,18 @@ class GameScreen(Screen):
     def restart(self):
         self.game = Game(Board(config.BOARD_COLS, config.BOARD_ROWS))
         self.ai = AIController()
+
+    def full_time(self):
+        """(choices, extra lines of text) for the full-time box."""
+        return FULL_TIME_CHOICES, []
+
+    def full_time_choice(self, choice):
+        if choice == "play again":
+            self.restart()
+        elif choice == "main menu":
+            self.app.pop()
+        elif choice == "quit":
+            self.app.quit()
 
     def ai_turn(self):
         return self.ai.controls(self.game.active_team) and not self.game.over
@@ -897,13 +913,8 @@ class GameScreen(Screen):
             return False
         game = self.game
         if game.over:
-            choice = full_time_button_at_pixel(event.pos)
-            if choice == "play again":
-                self.restart()
-            elif choice == "main menu":
-                self.app.pop()
-            elif choice == "quit":
-                self.app.quit()
+            choices, lines = self.full_time()
+            self.full_time_choice(full_time_button_at_pixel(event.pos, choices, len(lines)))
             return True
         if self.ai_turn():
             return False                 # clicks are ignored while the AI plays
@@ -923,9 +934,436 @@ class GameScreen(Screen):
         self.ai.update(self.game)
 
     def draw(self, screen):
-        self.app.renderer.draw(self.game, self.ai_turn(), self.ai.highlight)
+        self.app.renderer.draw(self.game, self.ai_turn(), self.ai.highlight,
+                               self.full_time() if self.game.over else None)
         if not self.game.over:
             ui.text(screen, "Esc: menu", (10, 6), size=15, colour=ui.FAINT_TEXT_COLOUR)
+
+
+class RankedGameScreen(GameScreen):
+    """A ranked match: you (Home) against computer team `number` (Away), with
+    the current match settings. At full time the result goes into
+    app.ranking. Leaving or restarting before then changes nothing."""
+
+    leave_label = "Rankings"
+
+    def __init__(self, app, number):
+        self.number = number
+        self.outcome = None             # lines for the full-time box, once recorded
+        super().__init__(app)
+
+    def restart(self):
+        self.game = Game(Board(config.BOARD_COLS, config.BOARD_ROWS))
+        self.ai = AIController(controllers={config.HOME: "human", config.AWAY: "ai"})
+        self.outcome = None
+
+    def update(self):
+        super().update()
+        if self.game.over and self.outcome is None:
+            ladder = self.app.ranking
+            result = ranking_module.result_for(self.game.score, config.HOME)
+            old_rating = ladder.rating
+            points, before, after = ladder.record(self.number, result)
+            verb = {"win": "beat", "draw": "drew with", "loss": "lost to"}[result]
+            self.outcome = [f"You {verb} {ladder.team_name(self.number)}: {points:+} points",
+                            f"Rating {old_rating} -> {ladder.rating}, #{before} -> #{after}"]
+            if after == 1:
+                self.outcome.append("You're #1!")
+
+    def full_time(self):
+        return ["rankings", "quit"], self.outcome or []
+
+    def full_time_choice(self, choice):
+        if choice == "rankings":
+            self.app.pop()
+        elif choice == "quit":
+            self.app.quit()
+
+
+# --- Rankings ---
+
+def ladder(app):
+    """app.ranking, made on first use and started again if its settings changed."""
+    if getattr(app, "ranking", None) is None or app.ranking.out_of_date():
+        app.ranking = ranking_module.Ranking()
+    return app.ranking
+
+
+def can_play_ranked():
+    """(True, "") or (False, why not) for starting a ranked match."""
+    error, _ = check_config()
+    if error:
+        return False, "Can't play yet: " + error
+    if config.TURNS_PER_TEAM == 0:
+        return False, ("Ranked matches need a full time: set Turns per team in "
+                       "Match settings (it's No limit).")
+    return True, ""
+
+
+class RankingsScreen(Screen):
+    """The ladder, #1 at the top. Scroll with the mouse wheel, the arrow and
+    page keys, or the bar on the right."""
+
+    title = "Rankings"
+    TOP, ROW_H = 92, 34
+    COLUMNS = {"place": 40, "name": 110, "rating": 330}
+    VIEW_RECT = pygame.Rect(470, 0, 110, 28)       # x and size; y set per row
+    CHALLENGE_RECT = pygame.Rect(592, 0, 140, 28)
+    YOU_COLOUR = (255, 236, 160)
+    STRIPE_COLOUR = (228, 228, 228)
+
+    def __init__(self, app):
+        super().__init__(app)
+        ladder(app)
+        self.table = pygame.Rect(30, self.TOP, WIDTH - 60, HEIGHT - 110 - self.TOP)
+        self.bar = pygame.Rect(self.table.right - 12, self.table.top, 12, self.table.height)
+        self.dragging_bar = False
+        self.playable, self.why_not = True, ""
+        self.widgets = [
+            ui.Button(BACK_RECT, "Back", self.back),
+            ui.Button((160, HEIGHT - 56, 200, 40), "Ranking settings",
+                      lambda: app.push(RankingSettingsScreen(app))),
+            Confirm((380, HEIGHT - 56, 200, 40), "Start again", "Click again to start again",
+                    lambda: app.ranking.reset()),
+        ]
+        self.show_you()
+
+    # Scrolling
+
+    def rows(self):
+        return ladder(self.app).rows()
+
+    def max_scroll(self):
+        return max(0, len(self.rows()) * self.ROW_H - self.table.height)
+
+    def scroll_to(self, pixels):
+        self.scroll = max(0, min(self.max_scroll(), int(pixels)))
+
+    def show_you(self):
+        """Scroll so your row is in the middle of the table."""
+        you = ladder(self.app).place() - 1
+        self.scroll = 0
+        self.scroll_to(you * self.ROW_H - self.table.height // 2 + self.ROW_H // 2)
+
+    def thumb(self):
+        total = len(self.rows()) * self.ROW_H
+        if total <= self.table.height:
+            return None
+        height = max(30, self.bar.height * self.table.height // total)
+        top = self.bar.top + (self.bar.height - height) * self.scroll // self.max_scroll()
+        return pygame.Rect(self.bar.left, top, self.bar.width, height)
+
+    def drag_bar(self, y):
+        thumb = self.thumb()
+        if thumb is not None:
+            share = (y - self.bar.top - thumb.height / 2) / max(1, self.bar.height - thumb.height)
+            self.scroll_to(share * self.max_scroll())
+
+    # Input
+
+    def row_at(self, pos):
+        """(row, which button: "view", "challenge" or None) under pos, or (None, None)."""
+        if not self.table.collidepoint(pos) or pos[0] >= self.bar.left:
+            return None, None
+        index = (pos[1] - self.table.top + self.scroll) // self.ROW_H
+        rows = self.rows()
+        if not 0 <= index < len(rows):
+            return None, None
+        row = rows[index]
+        y = self.table.top + index * self.ROW_H - self.scroll + (self.ROW_H - self.VIEW_RECT.height) // 2
+        for name, rect in (("view", self.VIEW_RECT), ("challenge", self.CHALLENGE_RECT)):
+            if rect.move(0, y).collidepoint(pos):
+                return row, name
+        return row, None
+
+    def can_challenge(self, number):
+        return number is not None and self.playable and ladder(self.app).can_challenge(number)
+
+    def handle(self, event):
+        if super().handle(event):
+            return True
+        if event.type == pygame.MOUSEWHEEL:
+            self.scroll_to(self.scroll - event.y * self.ROW_H * 2)
+            return True
+        if event.type == pygame.KEYDOWN:
+            page = self.table.height - self.ROW_H
+            moves = {pygame.K_UP: -self.ROW_H, pygame.K_DOWN: self.ROW_H,
+                     pygame.K_PAGEUP: -page, pygame.K_PAGEDOWN: page}
+            if event.key in moves:
+                self.scroll_to(self.scroll + moves[event.key])
+            elif event.key == pygame.K_HOME:
+                self.scroll_to(0)
+            elif event.key == pygame.K_END:
+                self.scroll_to(self.max_scroll())
+            else:
+                return False
+            return True
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            if self.bar.collidepoint(event.pos):
+                self.dragging_bar = True
+                self.drag_bar(event.pos[1])
+                return True
+            row, button = self.row_at(event.pos)
+            if row is None:
+                return False
+            number = row[1]
+            if button == "view":
+                self.app.push(TeamViewScreen(self.app, number))
+            elif button == "challenge" and self.can_challenge(number):
+                self.app.push(RankedGameScreen(self.app, number))
+            return True
+        if event.type == pygame.MOUSEBUTTONUP and event.button == 1 and self.dragging_bar:
+            self.dragging_bar = False
+            return True
+        if event.type == pygame.MOUSEMOTION and self.dragging_bar:
+            self.drag_bar(event.pos[1])
+            return True
+        return False
+
+    def update(self):
+        self.playable, self.why_not = can_play_ranked()
+        self.scroll_to(self.scroll)          # the table may have changed size
+
+    # Drawing
+
+    def draw(self, screen):
+        super().draw(screen)
+        board = ladder(self.app)
+        header_y = self.TOP - 22
+        for key, label in (("place", "#"), ("name", "Team"), ("rating", "Rating")):
+            ui.text(screen, label, (self.COLUMNS[key], header_y), size=15, bold=True)
+        screen.set_clip(self.table)
+        for index, (place, number, name, rating) in enumerate(self.rows()):
+            top = self.table.top + index * self.ROW_H - self.scroll
+            if top + self.ROW_H < self.table.top or top > self.table.bottom:
+                continue
+            band = pygame.Rect(self.table.left, top, self.bar.left - self.table.left - 4, self.ROW_H)
+            if number is None:
+                pygame.draw.rect(screen, self.YOU_COLOUR, band)
+            elif index % 2:
+                pygame.draw.rect(screen, self.STRIPE_COLOUR, band)
+            middle = top + self.ROW_H // 2
+            you = number is None
+            ui.text(screen, f"#{place}", (self.COLUMNS["place"], middle), anchor="midleft", bold=you)
+            ui.text(screen, name, (self.COLUMNS["name"], middle), anchor="midleft", bold=you)
+            ui.text(screen, str(rating), (self.COLUMNS["rating"], middle), anchor="midleft", bold=you)
+            y = top + (self.ROW_H - self.VIEW_RECT.height) // 2
+            ui.draw_box(screen, self.VIEW_RECT.move(0, y), "View team", *ui.colours(), size=15)
+            if not you:
+                ui.draw_box(screen, self.CHALLENGE_RECT.move(0, y), "Challenge",
+                            *ui.colours(self.can_challenge(number)), size=15)
+        screen.set_clip(None)
+        pygame.draw.rect(screen, self.STRIPE_COLOUR, self.bar, border_radius=6)
+        thumb = self.thumb()
+        if thumb is not None:
+            pygame.draw.rect(screen, config.MID_GREY, thumb, border_radius=6)
+
+        if not self.playable:
+            line, colour = self.why_not, ui.ERROR_COLOUR
+        elif board.at_top():
+            line, colour = (f"You're #1 with {board.rating} points! There's nobody left to "
+                            f"challenge.", ui.TEXT_COLOUR)
+        else:
+            line, colour = (f"You're #{board.place()} of {board.size + 1} with {board.rating} "
+                            f"points. Challenge any team above you.", ui.FAINT_TEXT_COLOUR)
+        ui.wrapped(screen, line, pygame.Rect(30, self.table.bottom + 6, WIDTH - 60, 40),
+                   size=15, colour=colour)
+
+
+class TeamViewScreen(Screen):
+    """A team's players and their actions, before you challenge them.
+    number: the computer team's number, or None for your own team. Every
+    computer team plays as the Away team in config; you're the Home team."""
+
+    def __init__(self, app, number):
+        super().__init__(app)
+        self.number = number
+        self.team = config.HOME if number is None else config.AWAY
+        self.board = Board(config.BOARD_COLS, config.BOARD_ROWS)
+        for tile in self.board:
+            if tile.player is not None and tile.player.team != self.team:
+                tile.player = None
+        own = [tile for tile in self.board if tile.player is not None]
+        self.selected = own[0] if own else None
+        self.hovered = None
+        self.playable, self.why_not = True, ""
+        w, h = 150, 38
+        y = HEIGHT - h - 8
+        self.widgets = [ui.Button((20, y, 120, h), "Back", self.back)]
+        if number is not None:
+            self.widgets.append(ui.Button((WIDTH - w - 20, y, w, h), "Challenge", self.challenge,
+                                          enabled=self.can_challenge))
+
+    def can_challenge(self):
+        return self.playable and ladder(self.app).can_challenge(self.number)
+
+    def challenge(self):
+        self.app.pop()                                  # back to the table after the match
+        self.app.push(RankedGameScreen(self.app, self.number))
+
+    def update(self):
+        self.playable, self.why_not = can_play_ranked()
+
+    def handle(self, event):
+        if super().handle(event):
+            return True
+        if event.type == pygame.MOUSEMOTION:
+            tile = tile_at_pixel(event.pos, self.board)
+            self.hovered = tile if tile is not None and tile.player is not None else None
+        elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            tile = tile_at_pixel(event.pos, self.board)
+            if tile is not None and tile.player is not None:
+                self.selected = tile
+                return True
+        return False
+
+    def heading(self):
+        board = ladder(self.app)
+        if self.number is None:
+            return f"Your team ({config.TEAM_NAMES[self.team]}) - #{board.place()}, {board.rating} points"
+        place = next(row[0] for row in board.rows() if row[1] == self.number)
+        return (f"#{place} {board.team_name(self.number)} - {board.team_rating(self.number)} points"
+                f" (plays as {config.TEAM_NAMES[self.team]})")
+
+    def player_text(self, tile):
+        player = tile.player
+        role = "Goalkeeper" if getattr(player, "role", None) == "goalkeeper" else "Outfield player"
+        facing = "right" if player.facing == RIGHT else "left"
+        names = ", ".join(f"{i}. {name}" for i, name in enumerate(player.actions, 1))
+        return f"{role}, facing {facing}: {names}"
+
+    def preview(self):
+        """What each result would do to you, or why you can't challenge."""
+        board = ladder(self.app)
+        if self.number is None:
+            return "Click a player to see their actions."
+        if not self.playable:
+            return self.why_not
+        if not board.can_challenge(self.number):
+            return ("You're #1: there's nobody left to challenge." if board.at_top()
+                    else "This team is below you: you can only challenge teams above you.")
+        parts = []
+        for result, label in (("win", "Win"), ("draw", "Draw"), ("loss", "Lose")):
+            points = board.change(self.number, result)
+            place = board.place_after(self.number, result)
+            where = f"stay #{place}" if place == board.place() else f"to #{place}"
+            parts.append(f"{label} {points:+} points ({where})")
+        return "  |  ".join(parts)
+
+    def draw(self, screen):
+        screen.fill(config.BACKGROUND_COLOUR)
+        renderer = self.app.renderer
+        for tile in self.board:
+            border = None
+            if tile is self.selected:
+                border = (config.SELECTED_COLOUR, config.SELECTED_BORDER_WIDTH)
+            elif tile is self.hovered:
+                border = (config.MOVE_TARGET_COLOUR, config.BORDER_WIDTH)
+            renderer.draw_tile(tile, border, self.board)
+        ui.text(screen, self.heading(), (10, 4), bold=True)
+        shown = self.hovered or self.selected
+        if shown is not None:
+            ui.wrapped(screen, self.player_text(shown),
+                       pygame.Rect(20, config.UI_POSITION[1] + 4, WIDTH - 40, 48), size=15)
+        ui.wrapped(screen, self.preview(), pygame.Rect(160, HEIGHT - 44, WIDTH - 360, 40), size=15,
+                   colour=ui.ERROR_COLOUR if not self.playable and self.number is not None
+                   else ui.TEXT_COLOUR)
+        for widget in self.widgets:
+            widget.draw(screen)
+
+
+class FastStepper(ui.Stepper):
+    """A stepper with extra big-step buttons:  label ...  [--] [-] value [+] [++]"""
+
+    def __init__(self, rect, label, get, set, step, big_step, low=None, high=None, show=str):
+        super().__init__(rect, label, get, set, step, low, high, show)
+        self.big_step = big_step
+        h, gap = self.rect.height, 4
+        self.big_plus = pygame.Rect(self.rect.right - h, self.rect.top, h, h)
+        self.plus = self.big_plus.move(-h - gap, 0)
+        self.value_rect = pygame.Rect(self.plus.left - 90, self.rect.top, 90, h)
+        self.minus = pygame.Rect(self.value_rect.left - h, self.rect.top, h, h)
+        self.big_minus = self.minus.move(-h - gap, 0)
+
+    def handle(self, event):
+        for rect, direction in ((self.big_minus, -1), (self.big_plus, 1)):
+            if ui.clicked(event, rect):
+                step, self.step = self.step, self.big_step
+                self._change(direction)
+                self.step = step
+                return True
+        return super().handle(event)
+
+    def draw(self, screen):
+        super().draw(screen)
+        value = self.get()
+        big = self.show(self.big_step)
+        ui.draw_box(screen, self.big_minus, "-" + big,
+                    *ui.colours(self.low is None or value > self.low), size=14)
+        ui.draw_box(screen, self.big_plus, "+" + big,
+                    *ui.colours(self.high is None or value < self.high), size=14)
+
+
+class RankingSettingsScreen(Screen):
+    """How big the ladder is and how far results move you. Changing the
+    number of teams, the top rating or the points per place starts the
+    ladder again."""
+
+    title = "Ranking settings"
+
+    def __init__(self, app):
+        super().__init__(app)
+        x, w, h = 60, 680, 34
+        rows = iter(range(80, 600, 44))
+
+        def setter(name):
+            def set_value(value):
+                setattr(config, name, value)
+                settings.changed()
+            return set_value
+
+        def points(v):
+            return f"{v:g}"
+
+        def stepper(label, name, step, big, low, high, show=points):
+            return FastStepper((x, next(rows), w, h), label, lambda: getattr(config, name),
+                               setter(name), step, big, low, high, show)
+
+        self.widgets = [
+            stepper("Computer teams (starts the ladder again)", "RANKING_TEAMS", 1, 10, 1, 100),
+            stepper("Top team's rating (starts again)", "RANKING_TOP_RATING", 50, 500, 0, 10000),
+            stepper("Points between places (starts again)", "RANKING_POINTS_PER_PLACE", 1, 10, 1, 500),
+            stepper("Win: share of the rating gap gained", "RANKING_WIN_SHARE", 0.05, 0.25, 0.0, 2.0,
+                    percent),
+            stepper("Win: fewest points gained", "RANKING_MIN_WIN", 1, 10, 0, 1000),
+            stepper("Draw: share of the rating gap gained", "RANKING_DRAW_SHARE", 0.05, 0.25, 0.0, 1.0,
+                    percent),
+            stepper("Loss: most points lost (to a team just above)", "RANKING_LOSS_MAX", 1, 10, 0, 1000),
+            stepper("Loss: rating gap that halves the loss", "RANKING_LOSS_HALF_GAP", 10, 100, 0, 10000),
+            ui.Button(BACK_RECT, "Back", self.back),
+        ]
+
+    def examples(self):
+        """What results would do against teams some places above you, as text.
+        Places are points / points between places (from the bottom you can't
+        actually drop any lower)."""
+        sample = ranking_module.Ranking()
+        size, per_place = sample.size, sample.per_place
+        lines = ["Against a team this far above you (starting from the bottom):"]
+        for n in dict.fromkeys((size, max(1, size - 19), 1)):
+            above = size + 1 - n
+            parts = []
+            for result, label in (("win", "win"), ("draw", "draw"), ("loss", "lose")):
+                points = sample.change(n, result)
+                places = round(points / per_place)
+                parts.append(f"{label} {points:+} pts ({places:+} place{'' if abs(places) == 1 else 's'})")
+            lines.append(f"{above} place{'' if above == 1 else 's'} above: " + ",  ".join(parts))
+        return "\n".join(lines)
+
+    def draw(self, screen):
+        super().draw(screen)
+        ui.wrapped(screen, self.examples(), pygame.Rect(60, 438, WIDTH - 120, 100), size=15,
+                   colour=ui.FAINT_TEXT_COLOUR)
 
 
 class PauseScreen(Screen):
@@ -945,7 +1383,7 @@ class PauseScreen(Screen):
         self.widgets = [
             ui.Button(row(0), "Resume", self.back),
             ui.Button(row(1), "Restart match", self.restart),
-            ui.Button(row(2), "Main menu", self.main_menu),
+            ui.Button(row(2), game_screen.leave_label, self.main_menu),
             ui.Button(row(3), "Quit", app.quit),
         ]
         self.panel = pygame.Rect(0, 0, w + 60, 4 * (h + gap) + 80)

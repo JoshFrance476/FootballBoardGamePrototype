@@ -92,6 +92,25 @@ RECEIVE_POSSESSION_ACTIONS = 1  # any other way: receiving a pass, picking up a 
 # 0 = no limit.
 TURNS_PER_TEAM = 15
 
+# Ranking ladder (Rankings on the main menu). RANKING_TEAMS computer teams
+# (1 to 100), all playing as the Away team; you play as Home and start one
+# place below the bottom. You can challenge any team above you. Team #1 is
+# rated RANKING_TOP_RATING, each place below RANKING_POINTS_PER_PLACE less.
+# Changing those three starts the ladder again. With gap = their rating
+# minus yours:
+#   win   +max(RANKING_MIN_WIN, RANKING_WIN_SHARE * gap)
+#   draw  +RANKING_DRAW_SHARE * gap
+#   loss  -RANKING_LOSS_MAX * RANKING_LOSS_HALF_GAP / (RANKING_LOSS_HALF_GAP + gap)
+# so big upsets jump you further, and losing to a close team costs more.
+RANKING_TEAMS = 100
+RANKING_TOP_RATING = 2000
+RANKING_POINTS_PER_PLACE = 10
+RANKING_WIN_SHARE = 0.5
+RANKING_MIN_WIN = 10
+RANKING_DRAW_SHARE = 0.1
+RANKING_LOSS_MAX = 50
+RANKING_LOSS_HALF_GAP = 300
+
 # Facing: players only face right or left. The free step turns a player to
 # face the side they stepped towards (straight up/down keeps their facing).
 # Actions never change facing unless they have "turn": True.

@@ -71,6 +71,9 @@ def config_defaults():
         "TURNS_PER_TEAM": 0,
         "AI_RESULT_WEIGHT": 2.0,
         "AI_CHASE_BOOST": {"behind": 0.0, "level": 0.0, "ahead": 0.0},   # 0 = ignore the score
+        "RANKING_TEAMS": 100, "RANKING_TOP_RATING": 2000, "RANKING_POINTS_PER_PLACE": 10,
+        "RANKING_WIN_SHARE": 0.5, "RANKING_MIN_WIN": 10, "RANKING_DRAW_SHARE": 0.1,
+        "RANKING_LOSS_MAX": 50, "RANKING_LOSS_HALF_GAP": 300,
         "ZOC_TACKLE_CHANCE": {"front": 0.0, "behind": 0.0},   # 0 = no zone of control
         "INTERCEPT_CHANCE": 0.0,                               # 0 = no interceptions
         "MAX_PLAYER_ACTIONS": 0,            # 0 = no limit
@@ -628,6 +631,15 @@ def validate_config():
         value = getattr(config, name)
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
             raise ValueError(f"config.{name} must be a whole number, 0 or more")
+    if not isinstance(config.RANKING_TEAMS, int) or not 1 <= config.RANKING_TEAMS <= 100:
+        raise ValueError("config.RANKING_TEAMS must be a whole number from 1 to 100")
+    for name in ("RANKING_TOP_RATING", "RANKING_POINTS_PER_PLACE", "RANKING_MIN_WIN",
+                 "RANKING_WIN_SHARE", "RANKING_DRAW_SHARE", "RANKING_LOSS_MAX", "RANKING_LOSS_HALF_GAP"):
+        value = getattr(config, name)
+        if not isinstance(value, (int, float)) or value < 0:
+            raise ValueError(f"config.{name} must be a number, 0 or more")
+    if config.RANKING_POINTS_PER_PLACE <= 0:
+        raise ValueError("config.RANKING_POINTS_PER_PLACE must be more than 0")
     if not isinstance(config.TURNS_PER_TEAM, int) or config.TURNS_PER_TEAM < 0:
         raise ValueError("config.TURNS_PER_TEAM must be a whole number (0 = no limit)")
     if config.AI_ENGINE not in ("planner", "mcts"):

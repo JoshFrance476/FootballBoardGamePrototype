@@ -104,31 +104,33 @@ def end_turn_button():
     return pygame.Rect(x, config.UI_POSITION[1], width, height)
 
 
-def full_time_panel():
-    """pygame.Rect of the full-time box, centred on the screen."""
+FULL_TIME_CHOICES = ["play again", "main menu", "quit"]
+FULL_TIME_LINE_HEIGHT = 24      # each extra line of text (e.g. the ranking change) adds this
+
+
+def full_time_panel(extra_lines=0):
+    """pygame.Rect of the full-time box, centred on the screen, taller for
+    extra lines of text under the result."""
     width, height = config.FULL_TIME_PANEL_SIZE
-    rect = pygame.Rect(0, 0, width, height)
+    rect = pygame.Rect(0, 0, width, height + extra_lines * FULL_TIME_LINE_HEIGHT)
     rect.center = (config.SCREEN_SIZE[0] // 2, config.SCREEN_SIZE[1] // 2)
     return rect
 
 
-FULL_TIME_CHOICES = ["play again", "main menu", "quit"]
-
-
-def full_time_buttons():
+def full_time_buttons(choices=FULL_TIME_CHOICES, extra_lines=0):
     """{choice: Rect} side by side along the bottom of the full-time box."""
-    panel = full_time_panel()
+    panel = full_time_panel(extra_lines)
     width, height = config.BUTTON_SIZE
     gap = config.BUTTON_GAP * 2
-    total = len(FULL_TIME_CHOICES) * width + (len(FULL_TIME_CHOICES) - 1) * gap
+    total = len(choices) * width + (len(choices) - 1) * gap
     y = panel.bottom - height - 20
     return {name: pygame.Rect(panel.centerx - total // 2 + i * (width + gap), y, width, height)
-            for i, name in enumerate(FULL_TIME_CHOICES)}
+            for i, name in enumerate(choices)}
 
 
-def full_time_button_at_pixel(pos):
-    """"play again", "main menu", "quit" or None."""
-    for name, rect in full_time_buttons().items():
+def full_time_button_at_pixel(pos, choices=FULL_TIME_CHOICES, extra_lines=0):
+    """The choice under pos ("play again", "main menu", "quit"...) or None."""
+    for name, rect in full_time_buttons(choices, extra_lines).items():
         if rect.collidepoint(pos):
             return name
     return None
@@ -170,9 +172,11 @@ class Renderer:
         self.font = font
         self.button_font = button_font
 
-    def draw(self, game, ai_turn=False, highlight=None):
+    def draw(self, game, ai_turn=False, highlight=None, full_time=None):
         """Draw everything. ai_turn: a computer team is playing, so the End turn
-        button shows that instead. highlight: a tile to mark as the AI's choice."""
+        button shows that instead. highlight: a tile to mark as the AI's choice.
+        full_time: (choices, extra lines of text) for the full-time box, if not
+        the usual Play again / Main menu / Quit."""
         self.screen.fill(config.BACKGROUND_COLOUR)
         targets = set(game.targets)
         previews = set(game.preview_options) - targets     # destinations shown but not clickable
@@ -188,7 +192,7 @@ class Renderer:
         self.draw_action_buttons(game)
         self.draw_end_turn_button(game, ai_turn)
         if game.over:
-            self.draw_full_time(game)
+            self.draw_full_time(game, *(full_time or (FULL_TIME_CHOICES, [])))
 
     # --- Board ---
 
@@ -285,19 +289,23 @@ class Renderer:
             text = self.button_font.render(clock, True, config.BLACK)
             self.screen.blit(text, text.get_rect(topright=(config.SCREEN_SIZE[0] - 10, config.SCORE_Y)))
 
-    def draw_full_time(self, game):
-        """Dim the screen and show the result with Play again / Quit buttons."""
+    def draw_full_time(self, game, choices=FULL_TIME_CHOICES, lines=()):
+        """Dim the screen and show the result, any extra lines, and the choice buttons."""
         shade = pygame.Surface(config.SCREEN_SIZE, pygame.SRCALPHA)
         shade.fill(config.FULL_TIME_SHADE)
         self.screen.blit(shade, (0, 0))
-        panel = full_time_panel()
+        panel = full_time_panel(len(lines))
         pygame.draw.rect(self.screen, config.FULL_TIME_PANEL_COLOUR, panel,
                          border_radius=config.BUTTON_RADIUS * 2)
         title = self.font.render("Full time", True, config.BLACK)
         self.screen.blit(title, title.get_rect(midtop=(panel.centerx, panel.top + 20)))
         result = self.button_font.render(game.result_text(), True, config.BLACK)
         self.screen.blit(result, result.get_rect(midtop=(panel.centerx, panel.top + 60)))
-        for name, rect in full_time_buttons().items():
+        for i, line in enumerate(lines):
+            text = self.button_font.render(line, True, config.BLACK)
+            y = panel.top + 60 + (i + 1) * FULL_TIME_LINE_HEIGHT
+            self.screen.blit(text, text.get_rect(midtop=(panel.centerx, y)))
+        for name, rect in full_time_buttons(choices, len(lines)).items():
             self.draw_button(rect, name.capitalize(), config.BUTTON_COLOUR, config.BUTTON_TEXT_COLOUR)
 
     def draw_ui(self, game):

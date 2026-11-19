@@ -18,5 +18,6 @@ before challenging them, so they could pick out teams they think they can beat o
 > *Maybe you can only challenge teams higher in the rankings than you.*
 
 > How do we set the difficulty of AI opponents?
-> *I will have to test the AI algorithm to see if thinking times have a reliable effect on AI strength.*
+> *I will have to test the AI algorithm to see if thinking times have a reliable effect on AI strength. I imagine I will have to devise a system*
+> *to give AI teams different types of action sets to suit certain playstyles and with varying degrees of effectiveness.*
 
