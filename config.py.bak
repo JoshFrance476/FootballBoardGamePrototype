@@ -3,8 +3,8 @@ SCREEN_SIZE = (800, 600)
 HEX_SIZE = 30         # centre-to-corner radius of each drawn hex (smaller if the
                       # pitch wouldn't fit; it's always centred on the screen)
 HEX_GAP = 4           # gap between neighbouring hex edges in pixels (0 = touching)
-BOARD_COLS = 13      # keep both odd so there's a middle row for the goals and a centre spot
-BOARD_ROWS = 9
+BOARD_COLS = 11       # keep both odd so there's a middle row for the goals and a centre spot
+BOARD_ROWS = 7
 BALL_RADIUS = 8
 BORDER_WIDTH = 4      # default tile border thickness in pixels
 SELECTED_BORDER_WIDTH = 5
@@ -78,11 +78,14 @@ BOX_COLOUR = (0, 108, 0)   # slightly darker grass for each goalkeeper's box
 # first time that turn (holding it at the start of the turn counts; so do
 # receiving a pass, a tackle, or picking up a loose ball). See game.py.
 
+# Actions each team starts every turn with (before any possession bonuses)
+ACTIONS_PER_TURN = {HOME: 1, AWAY: 1}
+
 # Extra actions the team earns the first time each player has the ball in a
-# turn (on top of the one action every turn starts with). Receiving a pass or
-# picking up a loose ball earns 1; these two can be set:
-START_POSSESSION_ACTIONS = 1    # a player has the ball when the turn starts
-TACKLE_POSSESSION_ACTIONS = 2   # a player wins the ball with a tackle
+# turn (on top of the one action every turn starts with), by how they got it:
+START_POSSESSION_ACTIONS = 1  # a player has the ball when the turn starts
+TACKLE_POSSESSION_ACTIONS = 1  # a player wins the ball with a tackle
+RECEIVE_POSSESSION_ACTIONS = 1  # any other way: receiving a pass, picking up a loose ball
 
 # Match length: turns for each team. Turns alternate (the team that concedes
 # takes the next turn), so the match ends after twice this many turns.
@@ -102,6 +105,24 @@ TACKLE_CHANCE = {
     "behind": 0.4,
 }
 
+# Zone of control: when a player with the ball moves to another tile (their
+# free step, or an action that carries the ball), every opponent next to them
+# first gets a free tackle, best chance first, by which side of the carrier
+# they're on ("front" = the side the carrier faces before moving). If one
+# wins, the carrier stays where they were and the ball goes to that opponent;
+# otherwise the move goes ahead. A lofted carry ("lofted" with "with_player")
+# escapes it. 0 turns it off.
+ZOC_TACKLE_CHANCE = {
+    "front": 0.5,
+    "behind": 0.25,
+}
+
+# Interceptions: a pass that isn't lofted gives every opponent next to a tile
+# it crosses (not the passer's or the destination tile) this chance, once for
+# each such tile, in order along the path. The first success sends the ball to
+# that opponent instead. 0 turns it off.
+INTERCEPT_CHANCE = 0.2
+
 # Goalkeepers (a player with "role": "goalkeeper" in INITIAL_SETUP, at most
 # one per team). The box is every tile within KEEPER_BOX_RADIUS of a team's
 # own goal. Goalkeeping only works in the box: when a shot is on target, the
@@ -119,8 +140,8 @@ KEEPER_SAVE_CHANCE = {
 # can't shoot.
 SHOT_CHANCE = {
     1: 1.0,
-    2: 0.5,
-    3: 0.2,
+    2: 0.6,
+    3: 0.3,
 }
 
 # Actions a player can take. Each one combines any of these effects (it
@@ -160,6 +181,11 @@ SHOT_CHANCE = {
 #               which way the player faces, even if it moves them.
 #   An action can offer only one choice: a "self" list or a "ball" list, so
 #   one click always settles it.
+#   "shield":   an amount from 0 to 1 taken off the chance of any tackle on
+#               the player (normal or zone of control) afterwards, e.g. 0.3
+#               turns an 80% tackle into 50%. Lasts until the start of their
+#               team's next turn, or until the player moves. Shields don't add
+#               up: a second one only counts if it's bigger.
 #   "shoot":    True to shoot at the goal, with a chance from SHOT_CHANCE.
 #               The player must have the ball at their feet by this point.
 #               A goal sends everyone back to kick-off and gives the next
@@ -191,7 +217,7 @@ ACTIONS = {
     },
     "sprint": {                 # two steps forward, only without the ball
         "requires": ["no_possession"],
-        "self": [(3, -2), (1, 2), (3, -1), (2, 1), (2, -3), (-1, 3)],
+        "self": [(2, -1), (2, -2), (2, 0), (1, 1), (0, 2)],
     },
     "pass": {
         "requires": ["possession"],
@@ -211,13 +237,11 @@ ACTIONS = {
         "requires": ["possession"],
         "self": [(2, -1), (1, 1), (2, -2), (0, 2)],
         "ball": "with_player",
-        "lofted": True,
     },
     "backpass": {
         "requires": ["possession"],
         "ball": [(-1, -1), (-2, 1), (0, -2), (-2, 2)],
         "lofted": True,
-        "turn": True,
     },
     "tackle": {                 # try to win the ball from an adjacent opponent
         "tackle": True,
@@ -240,11 +264,20 @@ ACTIONS = {
         "requires": ["possession", "goalkeeper", "in_own_box"],
         "ball": [(1, 1), (2, -1), (3, -1), (2, 1), (2, -3), (-1, 3), (3, -2), (1, 2)],
     },
+    "shield": {                 # protect the ball: tackles on you are less likely until your next turn
+        "requires": ["possession"],
+        "shield": 0.2,
+    },
     "turn and run": {
         "requires": ["possession"],
         "self": (-2, 0),
         "ball": "with_player",
         "turn": True,
+    },
+    "cross": {
+        "requires": ["possession"],
+        "ball": [(-1, 3), (-1, 4), (-2, 5), (2, -3), (3, -4), (3, -5)],
+        "lofted": True,
     },
 }
 
@@ -266,32 +299,38 @@ FACING_HALF_WIDTH = 6  # half the width of the back edge
 # "actions" are names from ACTIONS, shown as buttons in this order.
 # Add "facing": RIGHT or LEFT to an entry to override TEAM_FACING, and
 # "role": "goalkeeper" for a keeper.
-OUTFIELD_ACTIONS = ["reposition", "dribble", "sprint", "pass", "lob", "pass and move", "backpass",
-                    "tackle", "shoot"]
+OUTFIELD_ACTIONS = ["reposition", "dribble", "sprint", "pass", "lob", "pass and move",
+                    "backpass", "tackle", "shoot", "shield", "cross"]
 KEEPER_ACTIONS = ["reposition", "pass", "drop-kick", "throw", "tackle"]
+
+# Most actions any one player can have, counting DEFAULT_ACTIONS (0 = no limit).
+# A player can have their own list instead of a shared set: edit it in the
+# menu (Formation, select a player, Actions...) or write it in INITIAL_SETUP,
+# e.g. {"actions": ["reposition", "pass", "shoot"], "position": (3, 4)}.
+MAX_PLAYER_ACTIONS = 12
 
 # 2-2-1 formation plus a goalkeeper on each goal tile, Away a mirror image of
 # Home. On this 13 x 9 pitch the goals are (-2, 4) and (10, 4) and the centre
 # spot is (4, 4).
 INITIAL_SETUP = {
     HOME: [                                                   # attacking right
-        {"actions": KEEPER_ACTIONS, "position": (-2, 4), "role": "goalkeeper"},
-        {"actions": OUTFIELD_ACTIONS, "position": (0, 3)},    # defender, top
-        {"actions": OUTFIELD_ACTIONS, "position": (-1, 5)},   # defender, bottom
-        {"actions": OUTFIELD_ACTIONS, "position": (3, 1)},    # midfielder, top wing
-        {"actions": OUTFIELD_ACTIONS, "position": (0, 7)},    # midfielder, bottom wing
-        {"actions": OUTFIELD_ACTIONS, "position": (3, 4)},    # striker, next to the ball
+        {"actions": KEEPER_ACTIONS, "position": (-2, 3), "role": "goalkeeper"},
+        {"actions": OUTFIELD_ACTIONS, "position": (0, 2)},
+        {"actions": OUTFIELD_ACTIONS, "position": (-1, 4)},
+        {"actions": OUTFIELD_ACTIONS, "position": (2, 1)},
+        {"actions": OUTFIELD_ACTIONS, "position": (0, 5)},
+        {"actions": OUTFIELD_ACTIONS, "position": (2, 3)},
     ],
     AWAY: [                                                   # attacking left
-        {"actions": KEEPER_ACTIONS, "position": (10, 4), "role": "goalkeeper"},
-        {"actions": OUTFIELD_ACTIONS, "position": (9, 3)},    # defender, top
-        {"actions": OUTFIELD_ACTIONS, "position": (8, 5)},    # defender, bottom
-        {"actions": OUTFIELD_ACTIONS, "position": (8, 1)},    # midfielder, top wing
-        {"actions": OUTFIELD_ACTIONS, "position": (5, 7)},    # midfielder, bottom wing
-        {"actions": OUTFIELD_ACTIONS, "position": (5, 4)},    # striker, next to the ball
+        {"actions": KEEPER_ACTIONS, "position": (8, 3), "role": "goalkeeper"},
+        {"actions": OUTFIELD_ACTIONS, "position": (7, 2)},
+        {"actions": OUTFIELD_ACTIONS, "position": (6, 4)},
+        {"actions": OUTFIELD_ACTIONS, "position": (6, 1)},
+        {"actions": OUTFIELD_ACTIONS, "position": (4, 5)},
+        {"actions": OUTFIELD_ACTIONS, "position": (4, 3)},
     ],
 }
-INITIAL_BALL = (4, 4)   # centre spot
+INITIAL_BALL = (3, 3)  # centre spot
 
 # --- Computer players ---
 # Who plays each team: "human" or "ai". Set both to "ai" to watch.
@@ -365,3 +404,6 @@ AI_WEIGHTS = {
 # worth ~0.3, a tile gained ~0.07 in midfield and ~0.13 in the final third, and
 # the AI shoots from 1-2 tiles. Lower progress or a curve of 1 make it sit on
 # the ball: holding safely beats the risk of losing it going forward.
+
+# Added by the in-game menu
+SHIFTED_ROWS = "top"

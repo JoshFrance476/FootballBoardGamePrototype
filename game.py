@@ -9,13 +9,23 @@ A turn:
     neighbouring tile, ending up facing the side (left or right) they stepped
     towards. A player with the ball takes it with them; stepping onto a loose
     ball picks it up.
-  - The team has one action, which any of its players can use.
+  - The team has config.ACTIONS_PER_TURN[team] actions (1 by default),
+    which any of its players can use.
   - The first time each player gets the ball in a turn, the team earns an
     extra actions, which any of its players can use: holding it at the start
     of the turn earns config.START_POSSESSION_ACTIONS, winning it with a
     tackle config.TACKLE_POSSESSION_ACTIONS, and any other way (receiving a
     pass, picking up a loose ball) config.RECEIVE_POSSESSION_ACTIONS. Getting it back later in the same turn earns nothing more.
   - Steps and actions can happen in any order. Press End turn when done.
+  - Shielding: an action with "shield" takes that much off the chance of
+    any tackle on the player (normal or zone of control) until their team's
+    next turn starts, or until they move.
+  - Zone of control: when a player with the ball steps (or carries it with an
+    action) to another tile, each opponent next to them gets a free tackle
+    first (config.ZOC_TACKLE_CHANCE). If one wins, the player stays where they
+    were (the step is still used) and the ball goes to that opponent. Passes
+    can be intercepted by opponents next to their path (config.INTERCEPT_CHANCE);
+    see actions.py.
 After a goal, everyone goes back to kick-off positions and the team that
 conceded takes the next turn. Turns always alternate, so a match of
 config.TURNS_PER_TEAM turns each is over after twice that many turns.
@@ -24,7 +34,7 @@ import random
 from typing import NamedTuple, Optional
 
 import config
-from actions import apply_outcome, outcomes, percent
+from actions import apply_outcome, outcomes, percent, preview_outcomes, zoc_tackles
 from hex_math import facing_after_move, neighbours
 
 
@@ -62,12 +72,16 @@ class Game:
             return
         self.active_team = team
         self.turn_number += 1
-        self.actions_remaining = 1  # actions any player on the team can use this turn
+        for tile in self.board.tiles.values():   # shields last until the team's next turn
+            if tile.player is not None and tile.player.team == team:
+                tile.player.shield = 0.0
+        self.actions_remaining = config.ACTIONS_PER_TURN[team]  # for any player on the team
         self.had_ball = set()       # coords of players who've had the ball this turn
         self.stepped = set()      # coords of players who've taken their free step this turn
         self.last_actions = {}    # tile coord -> name of the action its player last did this turn
-        self.selected = None      # the Tile whose player is selected, or None
+        self.selected = None      # the Tile whose player is selected (either team), or None
         self.action = None        # name of the action awaiting a target click, or None
+        self.hover_action = None  # name of the action button under the mouse, or None
         # Holding the ball at the start of the turn counts as a first possession
         self._check_new_carrier(config.START_POSSESSION_ACTIONS)
 
@@ -92,13 +106,14 @@ class Game:
         copy.last_actions = dict(self.last_actions)
         copy.selected = None
         copy.action = None
+        copy.hover_action = None
         return copy
 
     def snapshot(self):
         """Everything perform() can change, saved cheaply so a trial move can
         be undone with restore(). Much faster than clone() for "try a move,
         look at the result, take it back"."""
-        players = [(tile, tile.player, tile.player.facing)
+        players = [(tile, tile.player, tile.player.facing, tile.player.shield)
                    for tile in self.board.tiles.values() if tile.player is not None]
         return (self.board.ball, self.actions_remaining, frozenset(self.had_ball),
                 self.active_team, self.turn_number, self.over, dict(self.score),
@@ -110,9 +125,10 @@ class Game:
          message, players) = snapshot
         for tile in self.board.tiles.values():
             tile.player = None
-        for tile, player, facing in players:
+        for tile, player, facing, shield in players:
             tile.player = player
             player.facing = facing
+            player.shield = shield
         self.board.ball = ball
         self.actions_remaining = actions_remaining
         self.had_ball = set(had_ball)
@@ -219,14 +235,23 @@ class Game:
     def _step(self, move):
         tile, destination = self.board.get(move.coord), self.board.get(move.target)
         carrying = self.board.ball == tile.coord
+        risks = zoc_tackles(self.board, tile) if carrying else ()
+        # Zone of control: each opponent next to the carrier tackles first
+        for coord, chance in risks:
+            if self.roll() < chance:
+                self.board.ball = coord
+                self.stepped.add(tile.coord)    # the step is used up
+                self.message = f"Tackled stepping away ({percent(chance)})"
+                return tile
         facing = facing_after_move(tile.coord, destination.coord, tile.player.facing)
         self.board.move_player(tile, destination)
         if carrying:
             self.board.ball = destination.coord
         destination.player.facing = facing
+        destination.player.shield = 0.0         # moving ends a shield
         self._player_moved(tile.coord, destination.coord)
         self.stepped.add(destination.coord)
-        self.message = ""
+        self.message = ("Got away from the tackle" + ("s" if len(risks) > 1 else "")) if risks else ""
         return destination
 
     def _act(self, move):
@@ -274,14 +299,24 @@ class Game:
     @property
     def available_actions(self):
         """Names of the selected player's actions, in button order."""
-        if self.selected is None:
+        if self.selected is None or self.selected.player is None:
             return []
         return self.selected.player.actions
 
+    @property
+    def viewing_opponent(self):
+        """True if the selected player is on the other team: their actions can
+        be looked at (previewed) but not used."""
+        return (self.selected is not None and self.selected.player is not None
+                and self.selected.player.team != self.active_team)
+
     def options_for(self, action_name):
-        """{clickable coord: Outcome} for the selected player, or {} if they
-        can't use the action right now (including having no action left)."""
-        if self.selected is None or not self.can_act(self.selected):
+        """{coord: Outcome} for the selected player's action, or {} if it can't
+        be used now. For your own player that includes having no action left;
+        for an opponent it's what the action could do on their turn from here."""
+        if self.selected is None:
+            return {}
+        if not self.viewing_opponent and not self.can_act(self.selected):
             return {}
         return outcomes(self.board, self.selected, action_name)
 
@@ -289,17 +324,42 @@ class Game:
         return bool(self.options_for(action_name))
 
     @property
+    def preview_action(self):
+        """The action to show destinations for: the chosen one, otherwise the
+        one whose button is under the mouse."""
+        if self.action is not None:
+            return self.action
+        if self.hover_action in self.available_actions:
+            return self.hover_action
+        return None
+
+    @property
+    def preview_options(self):
+        """{coord: Outcome} to draw for preview_action (may not be clickable).
+        For an action the player can't use right now (e.g. a pass without the
+        ball), where it would go if they could."""
+        name = self.preview_action
+        if name is None:
+            return {}
+        return self.options_for(name) or preview_outcomes(self.board, self.selected, name)
+
+    @property
+    def preview_usable(self):
+        """True if preview_action can be used right now (not just shown)."""
+        return self.preview_action is not None and self.can_use(self.preview_action)
+
+    @property
     def options(self):
         """{clickable coord: Outcome} for the chosen action."""
-        if self.action is None:
+        if self.action is None or self.viewing_opponent:
             return {}
         return self.options_for(self.action)
 
     @property
     def selected_step_targets(self):
         """Tiles the selected player could step to right now (only when no
-        action is chosen)."""
-        if self.selected is None or self.action is not None:
+        action is chosen, and only for your own players)."""
+        if self.selected is None or self.action is not None or self.viewing_opponent:
             return []
         return self.step_targets(self.selected)
 
@@ -310,9 +370,10 @@ class Game:
 
     @property
     def status(self):
-        """Text for the status line: the chosen action's chances, or the last result."""
-        if self.action is not None:
-            options = self.options.values()
+        """Text for the status line: the chosen (or hovered) action's chances,
+        or the last result."""
+        if self.preview_action is not None:
+            options = self.preview_options.values()
             parts = []
             tackles = sorted({o.tackle_chance for o in options if o.tackle_from is not None})
             shots = sorted({o.score_chance for o in options if o.shot_at is not None})
@@ -323,16 +384,35 @@ class Game:
                 parts.append("Score " + " / ".join(map(percent, shots)))
             if saves:
                 parts.append("keeper saves " + " / ".join(map(percent, saves)))
+            losses = sorted({o.loss_chance for o in options if o.loss_chance > 0})
+            if losses:
+                parts.append("lose the ball " + " / ".join(map(percent, losses)))
+            if not self.preview_usable:
+                if not self.preview_options:
+                    return f"Can't {self.preview_action} from here"
+                return (f"Can't {self.preview_action} now: showing where it would go"
+                        + (f" ({', '.join(parts)})" if parts else ""))
             if parts:
                 return "Chance: " + ", ".join(parts)
+        elif self.viewing_opponent:
+            return (f"Viewing a {config.TEAM_NAMES[self.selected.player.team]} player: "
+                    f"hover over an action to see where it goes")
+        elif self.selected is not None and self.board.ball == self.selected.coord \
+                and self.selected_step_targets:
+            keep = 1.0
+            for _, chance in zoc_tackles(self.board, self.selected):
+                keep *= 1 - chance
+            if keep < 1:
+                risk = f"Stepping away: {percent(1 - keep)} chance of being tackled"
+                return f"{self.message} - {risk}" if self.message else risk
         return self.message
 
     # --- Human input ---
 
     def choose_action(self, action_name):
         """Handle a click on an action button."""
-        if self.over:
-            return
+        if self.over or self.viewing_opponent:
+            return                      # an opponent's actions can only be looked at
         if action_name == self.action:
             self.action = None          # clicking the chosen action again cancels it
         elif self.can_use(action_name):
@@ -357,6 +437,11 @@ class Game:
 
         # Clicked one of your own players: select them
         elif tile.player is not None and tile.player.team == self.active_team:
+            self.selected = tile
+            self.action = None
+
+        # Clicked an opponent: select them to look at their actions
+        elif tile.player is not None:
             self.selected = tile
             self.action = None
 

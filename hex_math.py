@@ -12,21 +12,32 @@ from functools import lru_cache
 SQRT3 = math.sqrt(3)
 
 
-def rectangle_coords(cols, rows):
-    """Axial coordinates for a rectangular board, odd rows shifted right.
+def rectangle_coords(cols, rows, shift_top=False):
+    """Axial coordinates for a rectangular board, every other row shifted.
 
     In axial coordinates a straight column leans diagonally, so each pair of
     rows shifts the q range left by one to keep the board rectangular.
-    Odd rows sit half a tile to the right, so they get one tile fewer: then
-    both side edges zigzag the same way and the board is an exact mirror
-    image left-to-right.
+    The shifted rows sit half a tile to the right of the others and get one
+    tile fewer: then both side edges zigzag the same way and the board is an
+    exact mirror image left-to-right. Normally the second row (and every
+    other row after it) is shifted; with shift_top the top row is.
     """
     coords = []
     for r in range(rows):
-        r_offset = r // 2
-        for q in range(-r_offset, cols - r_offset - r % 2):
+        start = row_start(r, shift_top)
+        for q in range(start, start + cols - row_is_short(r, shift_top)):
             coords.append((q, r))
     return coords
+
+
+def row_start(r, shift_top=False):
+    """The q of the leftmost tile in row r of a rectangle_coords board."""
+    return -((r + 1) // 2) if shift_top else -(r // 2)
+
+
+def row_is_short(r, shift_top=False):
+    """True for the shifted rows of a rectangle_coords board (one tile fewer)."""
+    return r % 2 == (0 if shift_top else 1)
 
 
 # The six neighbour offsets, clockwise on screen starting from east:

@@ -7,14 +7,18 @@ whole turn at once and checks it against the opponent's best reply:
      move. It keeps the best few partial plans at each step (by the
      evaluation), drops plans that reach the same position by doing the
      same moves in a different order, and finishes each plan with the
-     off-ball positioning steps (ai.positioning_step).
+     off-ball positioning steps (ai.positioning_step). The shortlist then
+     takes turns between the kinds of plan (keep the ball where it is, move
+     it, tackle, shoot) and keeps only a couple of near-identical plans, so
+     a pass or a tackle isn't crowded out by twenty ways of doing nothing.
   2. Replies: for the most promising plans, the same beam search builds the
      opponent's best replies from the position each plan leaves.
   3. Choice: each plan is scored by the opponent's best reply against it
      (the reply that's worst for us), with tackles and shots averaged over
      their dice. The best-scoring plan is played.
 
-A plan stops at the first move that rolls dice (a tackle or a shot): what to
+A plan stops at the first move that rolls dice (a tackle, a shot, or a move
+that risks a zone of control tackle or an interception): what to
 do next depends on the result, so the rest of the turn is planned again once
 it's known. For scoring, the turn after such a move is finished greedily for
 each possible result.
@@ -24,13 +28,18 @@ planning again whenever the game isn't where the plan expects.
 """
 import math
 import time
+from collections import Counter
 
 import config
-from actions import dice_branches, outcomes
-from ai import action_charge, deterministic, evaluate, positioning_step, search_moves
-from game import END_TURN, other_team
+from ai import (action_charge, deterministic, evaluate, move_branches, positioning_step,
+                search_moves)
+from game import END_TURN, STEP, other_team
+from hex_math import neighbours
 
 MAX_TURN_MOVES = 12             # safety limit on searched moves in one turn
+PLANS_PER_GROUP = 2             # near-identical plans kept on a shortlist (see plan_group)
+SHORTLIST_MARGIN = 0.6          # a kind of plan only gets a place while its plans are within
+                                # this much of the best plan's quick estimate
 
 
 # --- Small helpers ---
@@ -38,7 +47,7 @@ MAX_TURN_MOVES = 12             # safety limit on searched moves in one turn
 def signature(game):
     """Everything that decides what can happen next, so two plans reaching
     the same position (e.g. the same moves in another order) count once."""
-    players = frozenset((tile.coord, tile.player.team, tile.player.facing)
+    players = frozenset((tile.coord, tile.player.team, tile.player.facing, tile.player.shield)
                         for tile in game.board.tiles.values() if tile.player is not None)
     return (game.turn_number, game.over, game.active_team, game.board.ball, game.actions_remaining,
             players, frozenset(game.stepped), frozenset(game.had_ball), tuple(sorted(game.score.items())))
@@ -55,10 +64,9 @@ def after(game, move, rolls=None):
 
 
 def dice_results(game, move):
-    """[(probability, rolls)] for each way a tackle/shot move can turn out
-    (including the keeper's save roll)."""
-    outcome = outcomes(game.board, game.board.get(move.coord), move.action)[move.target]
-    return dice_branches(outcome)
+    """[(probability, rolls)] for each way a move with dice can turn out:
+    tackles, zone of control tackles, interceptions, shots and saves."""
+    return move_branches(game, move)
 
 
 def finish_with_positioning(game):
@@ -87,10 +95,25 @@ def quick_value(game, move, team, start_score):
     if move == END_TURN:
         return evaluate(ended(game)[0], team, start_score)
     charge = config.AI_ACTION_COST * action_charge(move)
-    if deterministic(move):
+    if deterministic(move, game):
         return evaluate(after(game, move), team, start_score) - charge
     return sum(p * evaluate(after(game, move, rolls), team, start_score)
                for p, rolls in dice_results(game, move)) - charge
+
+
+def end_now_value(game, move, team, start_score):
+    """Value for team of playing move (dice averaged) and then ending the turn
+    straight away. Used to rank plans that stop at a dice move against plans
+    that finish the turn: both are then judged at the end of a turn, when
+    the opponents are about to move (so the risk of being tackled counts)."""
+    charge = config.AI_ACTION_COST * action_charge(move)
+    total = 0.0
+    for p, rolls in dice_results(game, move):
+        state = after(game, move, rolls)
+        if not state.over and state.active_team == game.active_team:
+            state.perform(END_TURN)
+        total += p * evaluate(state, team, start_score)
+    return total - charge
 
 
 def finish_turn_greedily(game, team, start_score, depth=0):
@@ -105,7 +128,7 @@ def finish_turn_greedily(game, team, start_score, depth=0):
     best = max(moves, key=lambda m: quick_value(game, m, team, start_score))
     if best == END_TURN:
         return [(1.0, ended(game)[0])]
-    if deterministic(best):
+    if deterministic(best, game):
         return finish_turn_greedily(after(game, best), team, start_score, depth + 1)
     results = []
     for p, rolls in dice_results(game, best):
@@ -165,8 +188,8 @@ def candidate_turns(game, width, count, deadline):
                     if key not in finished:
                         finished[key] = TurnPlan(game, moves + closing, final=final,
                                                  score=evaluate(final, team, start_score))
-                elif not deterministic(move):
-                    value = quick_value(state, move, team, start_score)
+                elif not deterministic(move, state):
+                    value = end_now_value(state, move, team, start_score)
                     key = (signature(state), move)
                     if key not in finished:
                         finished[key] = TurnPlan(game, moves + [move], chance_state=state, score=value)
@@ -181,8 +204,71 @@ def candidate_turns(game, width, count, deadline):
                     partial.append((value, nxt, moves + [move]))
         partial.sort(key=lambda item: item[0], reverse=True)
         beam = [(state, moves) for _, state, moves in partial[:width]]
-    plans = sorted(finished.values(), key=lambda plan: plan.score, reverse=True)
-    return plans[:count]
+    return shortlist(finished.values(), count)
+
+
+def plan_kind(plan):
+    """What a plan does with the ball: "shot", "tackle", "ball" (it moves the
+    ball, or risks it to a zone of control tackle or an interception) or
+    "hold" (the ball stays where it is)."""
+    last = plan.moves[-1]
+    if plan.final is None:                      # it ends with a move that rolls dice
+        action = {} if last.action == STEP else config.ACTIONS[last.action]
+        return "shot" if action.get("shoot") else "tackle" if action.get("tackle") else "ball"
+    def holder(board):
+        tile = board.get(board.ball)
+        return None if tile.player is None else tile.player.team
+
+    moved = (plan.final.board.ball != plan.start.board.ball
+             or holder(plan.final.board) != holder(plan.start.board)
+             or plan.final.score != plan.start.score)
+    return "ball" if moved else "hold"
+
+
+def plan_group(plan):
+    """Plans with the same group are near-identical: the same dice move from
+    the same spot, or the same end position around the ball (off-ball
+    players stood a bit differently)."""
+    kind = plan_kind(plan)
+    if plan.final is None:
+        last = plan.moves[-1]
+        return kind, last.coord, last.action, last.target, plan.chance_state.board.ball
+    board = plan.final.board
+    around = frozenset((c, board.get(c).player.team) for c in neighbours(board.ball)
+                       if board.get(c) is not None and board.get(c).player is not None)
+    return kind, board.ball, around
+
+
+def shortlist(plans, count):
+    """The best `count` plans to check against replies, in the order to check
+    them. Kinds of plan (see plan_kind) take turns, best kind first, so each
+    kind's best plans are checked early even when the quick estimate rates
+    them lower (it can't see what the extra actions from winning the ball
+    or receiving a pass lead to). Only PLANS_PER_GROUP plans per plan_group,
+    and a kind drops out once its plans are SHORTLIST_MARGIN below the best."""
+    ranked = sorted(plans, key=lambda plan: plan.score, reverse=True)
+    if not ranked:
+        return []
+    floor = ranked[0].score - SHORTLIST_MARGIN
+    per_group = Counter()
+    by_kind = {}
+    for plan in ranked:
+        key = plan_group(plan)
+        if per_group[key] >= PLANS_PER_GROUP:
+            continue
+        per_group[key] += 1
+        by_kind.setdefault(key[0], []).append(plan)
+    picked = []
+    while len(picked) < count:
+        added = False
+        for kind in list(by_kind):              # in order of each kind's best plan
+            queue = by_kind[kind]
+            if queue and len(picked) < count and (not picked or queue[0].score >= floor):
+                picked.append(queue.pop(0))
+                added = True
+        if not added:
+            break
+    return picked
 
 
 # --- Choosing a turn ---
@@ -227,7 +313,7 @@ def best_turn(game, seconds=None):
         if value > best_value:
             best, best_value = plan, value
     return best.moves, {"plans": len(plans), "checked": checked, "value": best_value,
-                        "seconds": time.perf_counter() - started}
+                        "kind": plan_kind(best), "seconds": time.perf_counter() - started}
 
 
 class TurnPlayer:
@@ -249,7 +335,7 @@ class TurnPlayer:
         state = game.clone()
         for move in moves:
             self.queue.append((signature(state), move))
-            if move == END_TURN or not deterministic(move):
+            if move == END_TURN or not deterministic(move, state):
                 break           # after dice, plan again from the real result
             state.perform(move)
         return self.queue.pop(0)[1]

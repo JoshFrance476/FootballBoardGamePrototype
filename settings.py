@@ -13,24 +13,28 @@ import os
 import re
 from collections import deque
 
+import actions as actions_module
 import ai
 import config
-from hex_math import hex_distance, neighbours, rectangle_coords
+from board import shift_top
+from hex_math import hex_distance, neighbours, rectangle_coords, row_is_short, row_start
 
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.py")
 
 # Every setting the menu can change, in the order they're written back.
 EDITABLE = [
-    "TURNS_PER_TEAM", "CONTROLLERS", "AI_ENGINE", "AI_PLAN_SECONDS", "AI_THINK_SECONDS",
+    "TURNS_PER_TEAM", "CONTROLLERS", "ACTIONS_PER_TURN", "AI_ENGINE", "AI_PLAN_SECONDS", "AI_THINK_SECONDS",
     "AI_MOVE_DELAY", "BOARD_COLS", "BOARD_ROWS", "KEEPER_BOX_RADIUS", "TACKLE_CHANCE",
     "START_POSSESSION_ACTIONS", "TACKLE_POSSESSION_ACTIONS", "RECEIVE_POSSESSION_ACTIONS",
+    "ZOC_TACKLE_CHANCE", "INTERCEPT_CHANCE", "MAX_PLAYER_ACTIONS",
+    "SHIFTED_ROWS",
     "KEEPER_SAVE_CHANCE", "SHOT_CHANCE", "ACTIONS", "DEFAULT_ACTIONS", "OUTFIELD_ACTIONS",
     "KEEPER_ACTIONS", "INITIAL_SETUP", "INITIAL_BALL",
 ]
 
 # Keys of an action, in the order they're written out
 ACTION_KEY_ORDER = ["requires", "tackle", "self", "ball", "lofted", "turn", "face_movement",
-                    "shoot"]
+                    "shoot", "shield"]
 
 _saved = {}   # EDITABLE values as they are in config.py
 
@@ -55,6 +59,7 @@ def changed():
 def revert():
     """Throw away every edit: reload config.py."""
     importlib.reload(config)
+    actions_module.apply_config_defaults()
     _remember_saved()
     changed()
 
@@ -64,24 +69,29 @@ def revert():
 def to_offset(coord):
     """Axial (q, r) -> (column, row), column counted from each row's left end."""
     q, r = coord
-    return q + r // 2, r
+    return q - row_start(r, shift_top()), r
 
 
 def from_offset(col, row):
-    return col - row // 2, row
+    return col + row_start(row, shift_top()), row
 
 
 def row_length(row, cols=None):
-    """Tiles in a row: odd rows have one fewer, so the pitch is symmetric."""
+    """Tiles in a row: the shifted rows have one fewer, so the pitch is symmetric."""
     cols = config.BOARD_COLS if cols is None else cols
-    return cols - row % 2
+    return cols - row_is_short(row, shift_top())
+
+
+def pitch_coords(cols=None, rows=None):
+    cols = config.BOARD_COLS if cols is None else cols
+    rows = config.BOARD_ROWS if rows is None else rows
+    return rectangle_coords(cols, rows, shift_top())
 
 
 def goals(cols=None, rows=None):
     """{"left": coord, "right": coord}, as board.Board works them out."""
-    cols = config.BOARD_COLS if cols is None else cols
     rows = config.BOARD_ROWS if rows is None else rows
-    middle_row = sorted(c for c in rectangle_coords(cols, rows) if c[1] == rows // 2)
+    middle_row = sorted(c for c in pitch_coords(cols, rows) if c[1] == rows // 2)
     return {"left": middle_row[0], "right": middle_row[-1]}
 
 
@@ -107,9 +117,7 @@ def mirror(coord, cols=None):
 
 def nearest_free(coord, taken, cols=None, rows=None):
     """coord if it's on the board and free, else the closest tile that is."""
-    cols = config.BOARD_COLS if cols is None else cols
-    rows = config.BOARD_ROWS if rows is None else rows
-    board = set(rectangle_coords(cols, rows))
+    board = set(pitch_coords(cols, rows))
     if coord not in board:
         coord = min(board, key=lambda c: (hex_distance(c, coord), c))
     seen, queue = {coord}, deque([coord])
@@ -131,19 +139,43 @@ def all_entries():
 
 # --- Pitch and formation edits ---
 
+def stretch(index, old_count, new_count):
+    """Scale an index about the middle, rounding halves towards the middle
+    so mirror-image positions stay mirror images."""
+    old_mid, new_mid = (old_count - 1) / 2, (new_count - 1) / 2
+    x = new_mid + (index - old_mid) * (new_count - 1) / max(old_count - 1, 1)
+    if x - math.floor(x) == 0.5:
+        x = math.floor(x) if x > new_mid else math.ceil(x)
+    return min(max(round(x), 0), new_count - 1)
+
+
+def set_shifted_rows(value):
+    """Switch which rows are shifted ("top" or "second"), moving each player to
+    the matching place in their row (keepers to their goal, the ball to the
+    centre spot), so the formation keeps its shape and stays symmetric."""
+    if value == config.SHIFTED_ROWS:
+        return
+    old = [(team, entry, to_offset(entry["position"]), row_length(entry["position"][1]))
+           for team, entry in all_entries()]
+    config.SHIFTED_ROWS = value
+    taken = set()
+    for team, entry, _, _ in old:
+        if entry.get("role") == "goalkeeper":
+            entry["position"] = nearest_free(own_goal(team), taken)
+            taken.add(entry["position"])
+    for team, entry, (col, row), old_length in old:
+        if entry.get("role") != "goalkeeper":
+            new_col = stretch(col, old_length, row_length(row))
+            entry["position"] = nearest_free(from_offset(new_col, row), taken)
+            taken.add(entry["position"])
+    config.INITIAL_BALL = centre_spot()
+    changed()
+
+
 def resize_pitch(cols, rows):
     """Change the pitch size, stretching the starting positions to fit.
     Keepers go to their goal tile and the ball to the centre spot."""
     old_cols, old_rows = config.BOARD_COLS, config.BOARD_ROWS
-
-    def stretch(index, old_count, new_count):
-        """Scale an index about the middle, rounding halves towards the middle
-        so mirror-image positions stay mirror images."""
-        old_mid, new_mid = (old_count - 1) / 2, (new_count - 1) / 2
-        x = new_mid + (index - old_mid) * (new_count - 1) / max(old_count - 1, 1)
-        if x - math.floor(x) == 0.5:
-            x = math.floor(x) if x > new_mid else math.ceil(x)
-        return min(max(round(x), 0), new_count - 1)
 
     def scale(coord):
         col, row = to_offset(coord)
@@ -223,6 +255,44 @@ def set_keeper(team, entry, keeper):
         entry.pop("role", None)
         entry["actions"] = config.OUTFIELD_ACTIONS
     changed()
+
+
+# --- One player's actions ---
+
+def toggle_player_action(entry, name):
+    """Give a player an action (at the end of their buttons) or take it away.
+    The player gets their own list, so a shared set like OUTFIELD_ACTIONS and
+    the other players using it don't change."""
+    names = list(entry["actions"])
+    if name in names:
+        names.remove(name)
+    else:
+        names.append(name)
+    entry["actions"] = names
+    changed()
+
+
+def use_action_set(entry, list_name):
+    """Put a player back on a shared set: "OUTFIELD_ACTIONS" or "KEEPER_ACTIONS"."""
+    entry["actions"] = getattr(config, list_name)
+    changed()
+
+
+def copy_actions_to_teammates(team, entry):
+    """Give every other outfield player on the team the same actions as entry
+    (keepers keep theirs). Each gets their own copy."""
+    for other in config.INITIAL_SETUP[team]:
+        if other is not entry and other.get("role") != "goalkeeper":
+            other["actions"] = list(entry["actions"])
+    changed()
+
+
+def action_set_name(entry):
+    """"Outfield set", "Keeper set" or "Own set" for a player's actions."""
+    for list_name, label in (("OUTFIELD_ACTIONS", "Outfield set"), ("KEEPER_ACTIONS", "Keeper set")):
+        if entry["actions"] is getattr(config, list_name) or entry["actions"] == getattr(config, list_name):
+            return label
+    return "Own set"
 
 
 # --- Action edits ---
@@ -428,11 +498,11 @@ def format_setting(name, old_lines):
         return format_actions(old_lines)
     if name == "INITIAL_SETUP":
         return format_setup(old_lines)
-    if name in ("TACKLE_CHANCE", "SHOT_CHANCE", "KEEPER_SAVE_CHANCE"):
+    if name in ("TACKLE_CHANCE", "SHOT_CHANCE", "KEEPER_SAVE_CHANCE", "ZOC_TACKLE_CHANCE"):
         return format_chance_table(name, value, old_lines)
-    if name == "CONTROLLERS":
-        return "CONTROLLERS = {" + ", ".join(f"{team_key(t)}: {lit(c)}"
-                                             for t, c in value.items()) + "}"
+    if name in ("CONTROLLERS", "ACTIONS_PER_TURN"):
+        return f"{name} = {{" + ", ".join(f"{team_key(t)}: {lit(c)}"
+                                          for t, c in value.items()) + "}"
     if name in ACTION_LISTS:
         return wrap_list(f"{name} = ", list(value))
     return f"{name} = {lit(value)}"
@@ -472,7 +542,9 @@ def save_to_config(path=None):
         lines[start:end] = new.split("\n")
     missing = [n for n in names if n not in spans]
     if missing:
-        lines += ["", "# Added by the in-game menu"] + [format_setting(n, []) for n in missing]
+        while lines and not lines[-1].strip():
+            lines.pop()
+        lines += ["", "# Added by the in-game menu"] + [format_setting(n, []) for n in missing] + [""]
 
     new_source = "\n".join(lines)
     check = {}

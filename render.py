@@ -4,6 +4,7 @@ import math
 import pygame
 
 import config
+from board import shift_top
 from hex_math import (DIRECTIONS, SQRT3, hex_corners, hex_to_pixel, pixel_to_hex,
                       point_in_hex, rectangle_coords)
 
@@ -19,10 +20,10 @@ def layout():
     Hexes are config.HEX_SIZE when the pitch fits at that size, and shrink
     (gap and markers too) for bigger pitches. The pitch is centred.
     """
-    key = (config.BOARD_COLS, config.BOARD_ROWS, config.HEX_SIZE, config.HEX_GAP,
+    key = (config.BOARD_COLS, config.BOARD_ROWS, shift_top(), config.HEX_SIZE, config.HEX_GAP,
            config.SCREEN_SIZE, config.UI_POSITION, config.SCORE_Y)
     if key not in _layout_cache:
-        coords = rectangle_coords(config.BOARD_COLS, config.BOARD_ROWS)
+        coords = rectangle_coords(config.BOARD_COLS, config.BOARD_ROWS, shift_top())
         size, gap = config.HEX_SIZE, config.HEX_GAP
         points = [hex_to_pixel(q, r, size, gap) for q, r in coords]
         half_width, half_height = size * SQRT3 / 2, size
@@ -174,9 +175,10 @@ class Renderer:
         button shows that instead. highlight: a tile to mark as the AI's choice."""
         self.screen.fill(config.BACKGROUND_COLOUR)
         targets = set(game.targets)
+        previews = set(game.preview_options) - targets     # destinations shown but not clickable
         steps = set(game.selected_step_targets)
         for tile in game.board:
-            border = self.tile_border(tile, game.selected, targets, highlight, steps)
+            border = self.tile_border(tile, game.selected, targets, highlight, steps, previews)
             self.draw_tile(tile, border, game.board)
         self.draw_ball(game.board.ball)
         self.draw_player_previews(game)
@@ -190,12 +192,14 @@ class Renderer:
 
     # --- Board ---
 
-    def tile_border(self, tile, selected, targets, highlight=None, steps=()):
+    def tile_border(self, tile, selected, targets, highlight=None, steps=(), previews=()):
         """(colour, width) of the border this tile should have, or None."""
         if tile is selected or tile.coord == highlight:
             return config.SELECTED_COLOUR, config.SELECTED_BORDER_WIDTH
         if tile.coord in targets:
             return config.MOVE_TARGET_COLOUR, config.BORDER_WIDTH
+        if tile.coord in previews:
+            return config.PREVIEW_TARGET_COLOUR, config.BORDER_WIDTH
         if tile.coord in steps:
             return config.STEP_TARGET_COLOUR, config.STEP_TARGET_WIDTH
         return None
@@ -221,6 +225,10 @@ class Renderer:
             draw_bordered_hexagon(self.screen, colour, border_colour,
                                   centre, hex_size(), scaled(border_width))
         if tile.player is not None:
+            if tile.player.shield > 0:
+                inner = hex_size() - scaled(config.SHIELD_INSET)
+                pygame.draw.polygon(self.screen, config.SHIELD_COLOUR, hex_corners(centre, inner),
+                                    max(1, scaled(config.SHIELD_WIDTH)))
             self.draw_facing(centre, tile.player.facing)
 
     def draw_facing(self, centre, facing, colour=config.FACING_COLOUR):
@@ -248,7 +256,7 @@ class Renderer:
             return
         colour = config.TEAM_COLOURS[game.selected.player.team]
         facings = {}    # destination coord -> set of directions they could end up facing
-        for outcome in game.options.values():
+        for outcome in game.preview_options.values():
             if outcome.player_to != game.selected.coord:
                 facings.setdefault(outcome.player_to, set()).add(outcome.facing)
         for coord, directions in facings.items():
@@ -260,8 +268,8 @@ class Renderer:
                 self.draw_facing(centre, next(iter(directions)), colour)
 
     def draw_ball_previews(self, game):
-        """Outline where the chosen action would send the ball."""
-        for coord in {o.ball_to for o in game.options.values() if o.ball_to is not None}:
+        """Outline where the chosen (or hovered) action would send the ball."""
+        for coord in {o.ball_to for o in game.preview_options.values() if o.ball_to is not None}:
             pygame.draw.circle(self.screen, config.BALL_COLOUR, tile_centre(*coord),
                                scaled(config.BALL_RADIUS), config.PREVIEW_BALL_WIDTH)
 

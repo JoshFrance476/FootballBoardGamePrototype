@@ -172,7 +172,7 @@ class MatchScreen(Screen):
     def __init__(self, app):
         super().__init__(app)
         x, w, h = 140, 520, 36
-        rows = iter(range(100, 600, 50))
+        rows = iter(range(90, 600, 48))
 
         def controller(team):
             return ui.Choice((x, next(rows), w, h), f"{config.TEAM_NAMES[team]} played by",
@@ -189,9 +189,18 @@ class MatchScreen(Screen):
         def seconds(v):
             return f"{v:g} s"
 
+        def actions_per_turn(team):
+            def set_value(v):
+                config.ACTIONS_PER_TURN[team] = v
+                settings.changed()
+            return ui.Stepper((x, next(rows), w, h), f"{config.TEAM_NAMES[team]} actions per turn",
+                              lambda: config.ACTIONS_PER_TURN[team], set_value, 1, 0, 9)
+
         self.widgets = [
             controller(config.HOME),
             controller(config.AWAY),
+            actions_per_turn(config.HOME),
+            actions_per_turn(config.AWAY),
             ui.Stepper((x, next(rows), w, h), "Turns per team", lambda: config.TURNS_PER_TEAM,
                        setter("TURNS_PER_TEAM"), 1, 0, 99,
                        lambda v: "No limit" if v == 0 else str(v)),
@@ -214,7 +223,7 @@ class MatchScreen(Screen):
 
 class RulesScreen(Screen):
     title = "Pitch and rules"
-    MAX_SHOT_DISTANCE = 6
+    MAX_SHOT_DISTANCE = 5
 
     def __init__(self, app):
         super().__init__(app)
@@ -231,15 +240,25 @@ class RulesScreen(Screen):
                 settings.changed()
             return ui.Stepper(rect, label, lambda: table[key], set_value, 0.05, 0.0, 1.0, percent)
 
+        def intercept_setter(v):
+            config.INTERCEPT_CHANCE = v
+            settings.changed()
+
         widgets = [
-            ui.Stepper((left_x, 96, left_w, h), "Pitch width (tiles)", lambda: config.BOARD_COLS,
+            ui.Stepper((left_x, 92, left_w, h), "Pitch width (tiles)", lambda: config.BOARD_COLS,
                        lambda v: settings.resize_pitch(v, config.BOARD_ROWS), 2, 7, 25),
-            ui.Stepper((left_x, 132, left_w, h), "Pitch height (tiles)", lambda: config.BOARD_ROWS,
+            ui.Stepper((left_x, 126, left_w, h), "Pitch height (tiles)", lambda: config.BOARD_ROWS,
                        lambda v: settings.resize_pitch(config.BOARD_COLS, v), 2, 5, 17),
-            ui.Stepper((left_x, 168, left_w, h), "Keeper's box radius", lambda: config.KEEPER_BOX_RADIUS,
+            ui.Stepper((left_x, 160, left_w, h), "Keeper's box radius", lambda: config.KEEPER_BOX_RADIUS,
                        self.set_box_radius, 1, 0, 4),
-            chance_stepper((left_x, 214, left_w, h), "Tackle from the front", config.TACKLE_CHANCE, "front"),
-            chance_stepper((left_x, 250, left_w, h), "Tackle from behind", config.TACKLE_CHANCE, "behind"),
+            chance_stepper((left_x, 200, left_w, h), "Tackle from the front", config.TACKLE_CHANCE, "front"),
+            chance_stepper((left_x, 234, left_w, h), "Tackle from behind", config.TACKLE_CHANCE, "behind"),
+            chance_stepper((left_x, 268, left_w, h), "Moving away: tackle from front",
+                           config.ZOC_TACKLE_CHANCE, "front"),
+            chance_stepper((left_x, 302, left_w, h), "Moving away: tackle from behind",
+                           config.ZOC_TACKLE_CHANCE, "behind"),
+            ui.Stepper((left_x, 336, left_w, h), "Interception, per tile passed",
+                       lambda: config.INTERCEPT_CHANCE, intercept_setter, 0.05, 0.0, 1.0, percent),
             ui.Stepper((right_x, 128, right_w, h), "Starting a turn with the ball",
                        lambda: config.START_POSSESSION_ACTIONS,
                        self.count_setter("START_POSSESSION_ACTIONS"), 1, 0, 5),
@@ -250,11 +269,11 @@ class RulesScreen(Screen):
                        lambda: config.RECEIVE_POSSESSION_ACTIONS,
                        self.count_setter("RECEIVE_POSSESSION_ACTIONS"), 1, 0, 5),
         ]
-        y = 320
+        y = 400
         for distance in sorted(config.KEEPER_SAVE_CHANCE):
             label = "On the goal tile" if distance == 0 else f"{distance} tile{'s' if distance > 1 else ''} out"
             widgets.append(chance_stepper((left_x, y, left_w, h), label, config.KEEPER_SAVE_CHANCE, distance))
-            y += 36
+            y += 34
 
         y = 278
         for distance in sorted(config.SHOT_CHANCE):
@@ -266,7 +285,10 @@ class RulesScreen(Screen):
                       enabled=lambda: len(config.SHOT_CHANCE) < self.MAX_SHOT_DISTANCE),
             ui.Button((right_x + 175, y + 6, 165, h), "Remove furthest", self.remove_distance,
                       enabled=lambda: len(config.SHOT_CHANCE) > 1),
-            ui.Button(BACK_RECT, "Back", self.back),
+            ui.Choice((right_x, 508, right_w, h), "Shifted rows",
+                      [("top", "Top row"), ("second", "Second row")],
+                      lambda: config.SHIFTED_ROWS, settings.set_shifted_rows, option_width=100),
+            ui.Button((WIDTH - 140, HEIGHT - 50, 120, 40), "Back", self.back),
         ]
         self.widgets = widgets
 
@@ -306,12 +328,12 @@ class RulesScreen(Screen):
 
     def draw(self, screen):
         super().draw(screen)
-        ui.text(screen, "Keeper save chance (shots on target)", (30, 294), bold=True)
+        ui.text(screen, "Keeper save chance (shots on target)", (30, 376), bold=True)
         ui.text(screen, "Extra actions for a first possession", (430, 100), bold=True)
         ui.text(screen, "Shot on target, by distance from goal", (430, 250), bold=True)
-        ui.wrapped(screen, "Changing the pitch size stretches the starting positions to fit; "
-                           "check them on the Formation page.",
-                   pygame.Rect(160, HEIGHT - 56, 250, 50), size=15, colour=ui.FAINT_TEXT_COLOUR)
+        ui.text(screen, "Changing the pitch size stretches the starting positions to fit: "
+                        "check them on the Formation page.", (WIDTH // 2, 62), size=15,
+                colour=ui.FAINT_TEXT_COLOUR, anchor="midtop")
 
 
 # --- Formation ---
@@ -348,7 +370,11 @@ class FormationScreen(Screen):
                       lambda: self.selected[1].get("facing") if has_selection() else "none",
                       self.set_facing, option_width=96, enabled=has_selection),
             ui.Button((col(3), y2, w, h), "Remove player", self.remove, enabled=has_selection),
+            ui.Button((col(4), y2, w - 20, h), "Actions...", self.edit_actions, enabled=has_selection),
         ]
+
+    def edit_actions(self):
+        self.app.push(PlayerActionsScreen(self.app, *self.selected))
 
     # Edits
 
@@ -452,12 +478,107 @@ class FormationScreen(Screen):
                              for t, e in config.INITIAL_SETUP.items())
         ui.text(screen, "Formation", (10, 4), bold=True)
         ui.text(screen, counts, (WIDTH - 10, 4), anchor="topright")
-        hint = ("Click a tile to put the ball there" if self.placing_ball else
-                "Drag players or the ball; click a player to edit")
+        if self.placing_ball:
+            hint = "Click a tile to put the ball there"
+        elif self.selected is not None:
+            entry = self.selected[1]
+            count = len(actions_module.player_actions(entry["actions"]))
+            hint = f"Selected: {settings.action_set_name(entry)}, {count} actions"
+        else:
+            hint = "Drag players or the ball; click a player to edit"
         ui.text(screen, hint, (WIDTH // 2 - 40, 5), size=15, colour=ui.FAINT_TEXT_COLOUR,
                 anchor="midtop")
         for widget in self.widgets:
             widget.draw(screen)
+
+
+# --- One player's actions ---
+
+class PlayerActionsScreen(Screen):
+    """Tick the actions one player has, up to config.MAX_PLAYER_ACTIONS."""
+
+    COLUMNS, CELL_W, CELL_H, GAP = 3, 240, 34, 10
+
+    def __init__(self, app, team, entry):
+        super().__init__(app)
+        self.team, self.entry = team, entry
+        self.title = f"{config.TEAM_NAMES[team]} player's actions"
+        self.widgets = []
+        for i, name in enumerate(config.ACTIONS):
+            col, row = i % self.COLUMNS, i // self.COLUMNS
+            rect = (30 + col * (self.CELL_W + self.GAP), 96 + row * (self.CELL_H + 6),
+                    self.CELL_W, self.CELL_H)
+            self.widgets.append(ui.Toggle(rect, self.label_for(name), self.has_getter(name),
+                                          lambda on, name=name: self.toggle(name),
+                                          enabled=self.can_toggle(name)))
+
+        def set_limit(v):
+            config.MAX_PLAYER_ACTIONS = v
+            settings.changed()
+
+        y1, y2 = HEIGHT - 100, HEIGHT - 52
+        self.widgets += [
+            ui.Stepper((30, y1, 400, 36), "Most actions a player can have",
+                       lambda: config.MAX_PLAYER_ACTIONS, set_limit, 1, 0, 30,
+                       lambda v: "No limit" if v == 0 else str(v)),
+            ui.Button((30, y2, 150, 40), "Outfield set",
+                      lambda: settings.use_action_set(self.entry, "OUTFIELD_ACTIONS")),
+            ui.Button((190, y2, 150, 40), "Keeper set",
+                      lambda: settings.use_action_set(self.entry, "KEEPER_ACTIONS")),
+            ui.Button((350, y2, 230, 40), "Copy to outfield team-mates",
+                      lambda: settings.copy_actions_to_teammates(self.team, self.entry)),
+            ui.Button((WIDTH - 140, y2, 120, 40), "Back", self.back),
+        ]
+
+    def own(self):
+        return self.entry["actions"]
+
+    def toggle(self, name):
+        if name in config.DEFAULT_ACTIONS and name not in self.own():
+            return                             # everyone has it: nothing to change
+        settings.toggle_player_action(self.entry, name)
+
+    def count(self):
+        return len(actions_module.player_actions(self.own()))
+
+    def has_getter(self, name):
+        return lambda: name in self.own() or name in config.DEFAULT_ACTIONS
+
+    def label_for(self, name):
+        def label():
+            if name in self.own():
+                return f"{self.own().index(name) + 1}. {name}"
+            if name in config.DEFAULT_ACTIONS:
+                return f"{name} (everyone)"
+            return name
+        return label
+
+    def can_toggle(self, name):
+        def enabled():
+            if name in self.own():
+                return True                    # can always take one away
+            if name in config.DEFAULT_ACTIONS:
+                return True                    # shown as on; clicking does nothing
+            limit = config.MAX_PLAYER_ACTIONS
+            return limit == 0 or self.count() < limit
+        return enabled
+
+    def draw(self, screen):
+        super().draw(screen)
+        limit = config.MAX_PLAYER_ACTIONS
+        of = f" of {limit}" if limit else ""
+        ui.text(screen, f"Starting at {tuple(self.entry['position'])} - {settings.action_set_name(self.entry)}"
+                        f" - {self.count()}{of} actions", (WIDTH // 2, 62), size=15,
+                colour=ui.FAINT_TEXT_COLOUR, anchor="midtop")
+        rows = (len(config.ACTIONS) + self.COLUMNS - 1) // self.COLUMNS
+        top = 96 + rows * (self.CELL_H + 6) + 8
+        lines = ["Click an action to give it to this player or take it away. Their buttons appear "
+                 "in the numbered order. Actions given to everyone (DEFAULT_ACTIONS) count towards "
+                 "the limit. Changing this player doesn't change anyone else."]
+        if limit and self.count() > limit:
+            lines.append(f"This player has more than {limit} actions: take some away to play.")
+        ui.wrapped(screen, "\n".join(lines), pygame.Rect(30, top, WIDTH - 60, HEIGHT - 110 - top),
+                   size=15, colour=ui.ERROR_COLOUR if limit and self.count() > limit else ui.FAINT_TEXT_COLOUR)
 
 
 # --- Actions ---
@@ -524,7 +645,11 @@ class ActionsScreen(Screen):
             rect = (x + i * 91, 368, 87, 30)
             widgets.append(ui.Toggle(rect, label, self.given_getter(list_name),
                                      self.given_setter(list_name), enabled=has))
-        widgets.append(Confirm((x, 416, w, 32), "Delete action", "Click again to delete",
+        widgets.append(ui.Stepper((x, 412, w, 30), "Shield", self.get_shield, self.set_shield,
+                                  0.05, 0.0, 1.0,
+                                  lambda v: "Off" if v == 0 else f"-{percent(v)} tackles",
+                                  enabled=has))
+        widgets.append(Confirm((x, 452, w, 30), "Delete action", "Click again to delete",
                                self.delete, enabled=has))
         widgets.append(ui.Choice((480, 50, 310, 30), "Click sets",
                                  [("self", "Player"), ("ball", "Ball")],
@@ -566,6 +691,16 @@ class ActionsScreen(Screen):
                 self.action.pop(key, None)
             settings.changed()
         return set_value
+
+    def get_shield(self):
+        return self.action.get("shield", 0.0) if self.has_action() else 0.0
+
+    def set_shield(self, amount):
+        if amount > 0:
+            self.action["shield"] = amount
+        else:
+            self.action.pop("shield", None)
+        settings.changed()
 
     def given_getter(self, list_name):
         return lambda: self.has_action() and self.selected in getattr(config, list_name)
@@ -697,7 +832,7 @@ class ActionsScreen(Screen):
         for widget in self.widgets:
             widget.draw(screen)
         self.draw_grid(screen)
-        self.draw_messages(screen, pygame.Rect(x, 458, 270, HEIGHT - 466))
+        self.draw_messages(screen, pygame.Rect(x, 490, 270, HEIGHT - 496))
 
     def draw_grid(self, screen):
         action = self.action or {}
@@ -754,6 +889,10 @@ class GameScreen(Screen):
         if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
             self.app.push(PauseScreen(self.app, self))
             return True
+        if event.type == pygame.MOUSEMOTION:
+            # Hovering over an action button previews where it goes
+            self.game.hover_action = None if self.ai_turn() else action_at_pixel(event.pos, self.game)
+            return False
         if event.type != pygame.MOUSEBUTTONDOWN or event.button != 1:
             return False
         game = self.game
@@ -779,6 +918,8 @@ class GameScreen(Screen):
         return True
 
     def update(self):
+        if self.ai_turn():
+            self.game.hover_action = None   # the computer's choice is on show
         self.ai.update(self.game)
 
     def draw(self, screen):

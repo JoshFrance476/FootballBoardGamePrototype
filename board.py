@@ -10,6 +10,12 @@ from hex_math import hex_distance, rectangle_coords
 from player import Player
 
 
+def shift_top():
+    """True if config.SHIFTED_ROWS says the top row is one of the shifted
+    (half a tile across, one tile shorter) rows."""
+    return getattr(config, "SHIFTED_ROWS", "second") == "top"
+
+
 @dataclass
 class Tile:
     q: int
@@ -23,7 +29,7 @@ class Tile:
 
 class Board:
     def __init__(self, cols, rows):
-        self.tiles = {coord: Tile(*coord) for coord in rectangle_coords(cols, rows)}
+        self.tiles = {coord: Tile(*coord) for coord in rectangle_coords(cols, rows, shift_top())}
 
         # Each goal is the tile in the middle of the left or right edge
         middle_row = sorted(coord for coord in self.tiles if coord[1] == rows // 2)
@@ -38,7 +44,7 @@ class Board:
             coord: Tile(tile.q, tile.r,
                         None if tile.player is None else
                         Player(tile.player.team, tile.player.actions, tile.player.facing,
-                               tile.player.role))
+                               tile.player.role, tile.player.shield))
             for coord, tile in self.tiles.items()
         }
         copy.goals = self.goals     # never changes, so it can be shared
