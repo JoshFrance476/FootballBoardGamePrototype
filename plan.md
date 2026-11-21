@@ -48,6 +48,9 @@ Emulating football by combining chess with deckbuilding mechanics.
 
 Offside mechanic?
 
+There needs to be a solution to being able to entirely block tackles by surrounding the player in posession with other players or sitting next to the
+edge of the pitch. - a 'shove' mechanic that moves the target player forward and an opposition player back one tile if the tile behind is clear?
+
 Lobbing and goalkeeper need to be nerfed - it is too easy to convert gk possession in to a shot by combining a dropkick and lob if 
 players are spread out. Lobbing could have a probability of 'missing' and landing on an adjacent tile instead of the destination - would
 add risk to lobs and would disencourage lobbing to players adjacent to opponents. 

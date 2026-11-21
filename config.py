@@ -59,6 +59,10 @@ BUTTON_DISABLED_COLOUR = LIGHT_GREY   # can't be used right now
 BUTTON_DISABLED_TEXT_COLOUR = MID_GREY
 
 TOOLTIP_FONT_SIZE = 18                # the chances shown by the mouse
+ROUTE_COLOUR = (255, 255, 255)        # hovered move: the tiles the player's route crosses
+BALL_ROUTE_COLOUR = (255, 210, 60)    # hovered pass: the tiles a ground pass crosses
+ROUTE_WASH_ALPHA = 90                 # how see-through those highlights are (0-255)
+THREAT_COLOUR = (255, 120, 0)         # hovered move: opponents who'd tackle or could intercept
 TOOLTIP_BORDER_COLOUR = MID_GREY
 TEXT_COLOUR = BLACK                   # writing on the background and panels
 FAINT_TEXT_COLOUR = MID_GREY          # hints and greyed-out labels
@@ -154,14 +158,23 @@ RANKING_LOSS_HALF_GAP = 300
 # Actions never change facing unless they have "turn": True.
 RIGHT, LEFT = 0, 3   # same values as hex_math.RIGHT / hex_math.LEFT
 
+# Routes: players and passes move along a shortest route, through empty tiles
+# or teammates but not opponents (there can be several, e.g. two forward and
+# one up goes via the tile above or the tile ahead). With no clear route the
+# move or pass can't be made; lofted balls and lofted carries go over players
+# instead. When routes are equally safe, the one nearest the straight line is
+# taken, then across before up or down, so up and down mirror each other.
 # Tackling: there's no tackle action. A player tackles by moving (free step
-# or any action that moves them) from a tile next to the opponent with the
-# ball to another tile next to them - a single step round them counts. Won
-# or not, they end up where they were going, with the ball if it won.
-# Going past works the other way round: a carrier who moves from a tile next
-# to an opponent to another tile next to that opponent gives them a tackle;
-# if it wins the ball goes to that opponent and the carrier still moves.
-# Moving straight away from an opponent is safe. A lofted carry escapes.
+# or any action that moves them) along a route from a tile next to the
+# opponent with the ball to another tile next to them - a single step round
+# them counts. Only if every route crosses them: if one goes round, it's not
+# a tackle. Won or not, they end up where they were going, with the ball if
+# it won. Going past works the other way round: a carrier whose route goes
+# from a tile next to an opponent to another tile next to that opponent
+# gives them a tackle (the carrier takes their safest route); if it wins the
+# ball goes to that opponent and the carrier still moves. Moving straight
+# away from an opponent is safe. A lofted carry escapes. Passes take their
+# route least likely to be intercepted.
 # Chance, by which side of the carrier the tackler is on ("front" is the
 # three neighbouring tiles on the side the carrier faces, "behind" the other
 # three): for a tackle by moving across, where the tackler starts; for going
@@ -171,10 +184,6 @@ TACKLE_CHANCE = {
     "behind": 0.4,
 }
 
-# Moves longer than one tile: "path" checks every step along the move's
-# straight line (a two-tile run can cross or pass someone on the way),
-# "ends" only where the move starts and finishes.
-TACKLE_MOVE_CHECK = "path"
 
 # Interceptions: a pass that isn't lofted gives every opponent next to a tile
 # it crosses (not the passer's or the destination tile) this chance, once for

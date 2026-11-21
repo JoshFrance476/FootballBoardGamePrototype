@@ -289,6 +289,33 @@ class Renderer:
             text = self.button_font.render(clock, True, config.TEXT_COLOUR)
             self.screen.blit(text, text.get_rect(topright=(config.SCREEN_SIZE[0] - 10, config.SCORE_Y)))
 
+    def draw_route(self, info):
+        """Show where the hovered move goes (see Game.hover_route): the tiles
+        the player's route crosses and the tiles a ground pass crosses are
+        highlighted, and the opponents who'd tackle or could intercept are
+        outlined. A lofted ball crosses no tiles."""
+        if not info:
+            return
+        for coords, colour in ((info["route_tiles"], config.ROUTE_COLOUR),
+                               (info["ball_tiles"], config.BALL_ROUTE_COLOUR)):
+            for coord in coords:
+                self._highlight_tile(coord, colour)
+        for coord in info["threats"]:
+            pygame.draw.polygon(self.screen, config.THREAT_COLOUR,
+                                hex_corners(tile_centre(*coord), hex_size() - scaled(3)),
+                                max(2, scaled(4)))
+
+    def _highlight_tile(self, coord, colour):
+        """A see-through wash of colour over a tile, with an outline."""
+        centre = tile_centre(*coord)
+        size = hex_size()
+        corners = hex_corners((size, size), size)
+        wash = pygame.Surface((int(size * 2) + 2, int(size * 2) + 2), pygame.SRCALPHA)
+        pygame.draw.polygon(wash, (*colour[:3], config.ROUTE_WASH_ALPHA), corners)
+        self.screen.blit(wash, (centre[0] - size, centre[1] - size))
+        pygame.draw.polygon(self.screen, colour, hex_corners(centre, size - scaled(3)),
+                            max(2, scaled(3)))
+
     def draw_tooltip(self, lines, pos):
         """A small box of text lines just below-right of pos (the mouse),
         kept on the screen."""

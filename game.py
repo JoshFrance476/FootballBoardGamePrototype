@@ -430,6 +430,39 @@ class Game:
             return self.step_chances(coord)
         return []
 
+    def hover_route(self):
+        """What to draw for the tile under the mouse: {"route_tiles": the
+        tiles the player's route crosses, "ball_tiles": the tiles a ground
+        pass crosses (start and end not counted), "threats": coordinates of
+        the opponents who'd tackle or could intercept}. None if the mouse
+        isn't on a target of the chosen (or hovered) action or a step, or if
+        nobody could tackle or intercept on the way (then nothing is shown)."""
+        coord = self.hover_tile
+        if coord is None or self.selected is None or self.selected.player is None:
+            return None
+        if self.preview_action is not None:
+            outcome = self.preview_options.get(coord)
+            if outcome is None:
+                return None
+            threats = [c for c, _ in outcome.carry_tackles + outcome.intercepts]
+            if outcome.tackle_from is not None:
+                threats.append(outcome.tackle_from)
+            if not threats:
+                return None
+            return {"route_tiles": outcome.route[1:-1], "ball_tiles": outcome.ball_route[1:-1],
+                    "threats": list(dict.fromkeys(threats))}
+        if not self.viewing_opponent and coord in self.selected_step_targets:
+            tile = self.selected
+            if self.board.ball == tile.coord:
+                threats = [c for c, _ in carry_tackles(self.board, tile, coord)]
+            else:
+                tackle = moving_tackle(self.board, tile, coord)
+                threats = [tackle[0]] if tackle else []
+            if not threats:
+                return None
+            return {"route_tiles": (), "ball_tiles": (), "threats": threats}
+        return None
+
     def step_chances(self, target, show_safe=False):
         """Tooltip lines for the selected player's free step to target."""
         tile = self.selected

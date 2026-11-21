@@ -261,9 +261,7 @@ class RulesScreen(Screen):
                        self.set_box_radius, 1, 0, 4),
             chance_stepper((left_x, 200, left_w, h), "Tackle from the front", config.TACKLE_CHANCE, "front"),
             chance_stepper((left_x, 234, left_w, h), "Tackle from behind", config.TACKLE_CHANCE, "behind"),
-            ui.Choice((left_x, 268, left_w, h), "Long moves tackle on",
-                      [("path", "Every step"), ("ends", "Start + end")],
-                      lambda: config.TACKLE_MOVE_CHECK, self.set_move_check, option_width=100),
+
             ui.Stepper((left_x, 336, left_w, h), "Interception, per tile passed",
                        lambda: config.INTERCEPT_CHANCE, intercept_setter, 0.05, 0.0, 1.0, percent),
             ui.Stepper((right_x, 128, right_w, h), "Starting a turn with the ball",
@@ -299,10 +297,6 @@ class RulesScreen(Screen):
         ]
         self.widgets = widgets
 
-    @staticmethod
-    def set_move_check(value):
-        config.TACKLE_MOVE_CHECK = value
-        settings.changed()
 
     @staticmethod
     def count_setter(name):
@@ -991,6 +985,7 @@ class GameScreen(Screen):
         if not self.game.over:
             ui.text(screen, "Esc: menu", (10, 6), size=15, colour=ui.FAINT_TEXT_COLOUR)
         if not self.game.over and not self.ai_turn():
+            self.app.renderer.draw_route(self.game.hover_route())
             self.app.renderer.draw_tooltip(self.game.hover_chances(),
                                            getattr(self, "mouse", None) or ui.mouse_pos())
         marks = len(self.timestamps) + (len(self.replay_record["timestamps"])

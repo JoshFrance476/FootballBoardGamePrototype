@@ -24,44 +24,53 @@ A list of offsets gives the player a choice: every valid option is
 highlighted and they click the one they want. An action can offer at most one
 choice (a "self" list or a "ball" list), so a single click always settles it.
 
-Player and ball moves can't pass through a tile with an opponent on it
-(see path_blocked); "lofted": True lets an action's ball go over them. With
-"ball": "with_player", "lofted" lets the player (carrying the ball) go over
-them too.
-Shots aren't blocked.
+Routes: a player or ball moving from one tile to another goes along a
+shortest route, tile by tile (see routes). A move can have several (two
+forward and one up can go via the tile above or the tile ahead). Routes
+can go through teammates but not opponents, for players and passes alike.
+With no clear route, the move or pass can't be made.
+When routes are equally safe, the one closest to the straight line is
+taken, then the one going across before up or down, so aiming up and aiming
+down mirror each other (see shortest_routes).
+"lofted": True lets an action's ball go over players instead (no route
+needed, can't be intercepted). With "ball": "with_player", "lofted" lets
+the player (carrying the ball) go over them too. Shots aren't blocked.
 
 Tackling: there's no tackle action. A player tackles by moving across the
-opponent who has the ball: from a tile next to the carrier to another tile
-next to them (see crossing; a single step round them counts). The free step
-and any action that moves a player can do it. The chance is TACKLE_CHANCE
-for the side of the carrier the tackler starts from (front or behind, by the
-way the carrier faces), less the carrier's shield. Either way the tackler
-ends up where they were going: with the ball if the tackle wins.
+opponent who has the ball: their route goes from a tile next to the carrier
+to another tile next to them (a single step round them counts). It's only
+a tackle if every route of the move crosses the carrier; if one goes round,
+it isn't. The free step and any action that moves a player can do it. The
+chance is TACKLE_CHANCE for the side of the carrier the tackler starts
+crossing from (front or behind, by the way the carrier faces; the lower if
+routes differ), less the carrier's shield. Either way the tackler ends up
+where they were going: with the ball if the tackle wins.
 
-Going past: a carrier who moves past an opponent the same way (from a tile
-next to them to another tile next to them) gives that opponent a free
-tackle, with TACKLE_CHANCE for the side of the carrier the opponent is on.
-Shields don't count (moving ends them anyway). Each opponent passed gets one,
-in the order the move passes them; if one wins, the ball goes to them and the
-carrier still finishes the move, without it. A lofted carry (hurdle)
-escapes. Moving straight away from an opponent is safe.
+Going past: a carrier whose route goes past an opponent the same way (from
+a tile next to them to another tile next to them) gives that opponent a
+free tackle, with TACKLE_CHANCE for the side of the carrier the opponent is
+on. The carrier takes their safest route. Shields don't count (moving ends
+them anyway). Each opponent passed gets one, in the order the route passes
+them; if one wins, the ball goes to them and the carrier still finishes the
+move, without it. A lofted carry (hurdle) escapes. Moving straight away from
+an opponent is safe.
 
-Long moves: with TACKLE_MOVE_CHECK = "path", every step along a move's
-straight line counts, so a two-tile run can cross or pass someone on the way;
-with "ends", only where the move starts and finishes.
+Passes take their route least likely to be intercepted (see interceptions).
 
 Interceptions: a pass that isn't lofted can be intercepted by any opponent
 next to a tile it crosses (not counting the start and destination tiles),
 with INTERCEPT_CHANCE for each such tile, in order along the path. The first
 success sends the ball to that opponent instead.
 """
+import math
 import random
+from functools import lru_cache
 from dataclasses import dataclass
 from itertools import product
 from typing import Optional
 
 import config
-from hex_math import (facing_after_move, flipped, hex_distance, is_in_front, neighbours,
+from hex_math import (facing_after_move, flipped, hex_distance, hex_to_pixel, is_in_front, neighbours,
                       offset_for_facing, rectangle_coords, tiles_between)
 
 
@@ -83,13 +92,15 @@ def config_defaults():
         "RANKING_TEAMS": 100, "RANKING_TOP_RATING": 2000, "RANKING_POINTS_PER_PLACE": 10,
         "RANKING_WIN_SHARE": 0.5, "RANKING_MIN_WIN": 10, "RANKING_DRAW_SHARE": 0.1,
         "RANKING_LOSS_MAX": 50, "RANKING_LOSS_HALF_GAP": 300,
-        "TACKLE_MOVE_CHECK": "path",        # long moves tackle along every step ("ends": start/end only)
+
         "TEXT_COLOUR": (0, 0, 0), "FAINT_TEXT_COLOUR": (140, 140, 140), "ERROR_COLOUR": (190, 0, 0),
         "INPUT_COLOUR": (255, 255, 255), "STRIPE_COLOUR": (228, 228, 228),
         "HIGHLIGHT_ROW_COLOUR": (255, 236, 160),
         "DARK_MODE": False, "DARK_MODE_COLOURS": {}, "FULLSCREEN": False,
         "AI_PROGRESS_STOP": None, "REPLAY_FOLDER": "replays",
         "TOOLTIP_FONT_SIZE": 18, "TOOLTIP_BORDER_COLOUR": (140, 140, 140),
+        "ROUTE_COLOUR": (255, 255, 255), "BALL_ROUTE_COLOUR": (255, 210, 60),
+        "THREAT_COLOUR": (255, 120, 0), "ROUTE_WASH_ALPHA": 90,
         "INTERCEPT_CHANCE": 0.0,            # 0 = no interceptions
         "MAX_PLAYER_ACTIONS": 0,            # 0 = no limit
         "SHIFTED_ROWS": "second",           # which rows sit half a tile across
@@ -150,6 +161,8 @@ class Outcome:
     carry_tackles: tuple = ()            # ((opponent coord, chance), ...) the carrier goes past, in order
     intercepts: tuple = ()               # ((opponent coord, chance), ...) along the pass, in order
     shield: float = 0.0                  # the player's shield afterwards
+    route: tuple = ()                    # the player's route, start to end, if they move
+    ball_route: tuple = ()               # the ball's route if it's passed along the ground
 
     @property
     def score_chance(self):
@@ -208,15 +221,72 @@ def meets_requirements(board, tile, action):
 
 
 
+def _all_routes(start, end):
+    if start == end:
+        return [(start,)]
+    distance = hex_distance(start, end)
+    found = []
+    for step in neighbours(start):
+        if hex_distance(step, end) == distance - 1:
+            found.extend((start,) + rest for rest in _all_routes(step, end))
+    return found
+
+
+def route_preference(route):
+    """Sort key: which of several equally good routes to take. First the one
+    whose tiles stay closest to the straight line from start to end, then the
+    one going across (left/right) before up or down, so an action aimed up
+    takes the mirror image of its route aimed down. A move straight up or
+    down the screen has two mirror-image routes: it goes right first."""
+    points = [hex_to_pixel(q, r, 1.0) for q, r in route]
+    (sx, sy), (ex, ey) = points[0], points[-1]
+    length = math.hypot(ex - sx, ey - sy) or 1.0
+    off_line = sum(abs((ex - sx) * (py - sy) - (ey - sy) * (px - sx)) / length
+                   for px, py in points[1:-1])
+    vertical = tuple(round(abs(b[1] - a[1]), 6) for a, b in zip(points, points[1:]))
+    rightward = tuple(round(a[0] - b[0], 6) for a, b in zip(points, points[1:]))
+    return round(off_line, 6), vertical, rightward
+
+
+@lru_cache(maxsize=None)
+def shortest_routes(start, end):
+    """Every shortest route from start to end on an endless grid: tuples of
+    coordinates, start and end included, each a step from the last. In order
+    of preference (route_preference), so the first is taken when nothing
+    else separates them."""
+    return tuple(sorted(_all_routes(start, end), key=route_preference))
+
+
+def routes(board, start, end, through=None):
+    """The shortest routes from start to end that stay on the pitch and only
+    go through empty tiles, or tiles with players of team `through` on them
+    (the start and end tiles themselves can have anyone on them). In order of
+    preference. [] if there are none: the move can't be made."""
+    tiles = board.tiles
+    found = []
+    for route in shortest_routes(start, end):
+        if all(c in tiles for c in route) and all(
+                tiles[c].player is None or (through is not None and tiles[c].player.team == through)
+                for c in route[1:-1]):
+            found.append(route)
+    return found
+
+
 def path_blocked(board, player, start, end):
-    """True if an opponent of player stands anywhere along the straight line
-    from start to end. The start and end tiles themselves don't count, and
-    a line that only grazes an opponent's tile still counts as blocked."""
-    for coord in tiles_between(start, end):
-        other = board.get(coord)
-        if other is not None and other.player is not None and other.player.team != player.team:
-            return True
-    return False
+    """True if there's no clear route from start to end for player (or a
+    pass of theirs): every route has an opponent on it (see routes)."""
+    return not routes(board, start, end, player.team)
+
+
+def crossing_point(route, around):
+    """Where a route goes across (or past) the tile `around`: the first tile
+    of a step from a tile next to `around` to another tile next to it. None
+    if the route doesn't."""
+    near = neighbours(around)
+    for a, b in zip(route, route[1:]):
+        if a in near and b in near:
+            return a
+    return None
 
 
 def shielded(chance, player):
@@ -239,68 +309,68 @@ def tackle_chance(carrier, tackler):
     return shielded(config.TACKLE_CHANCE[side], carrier.player)
 
 
-def move_tiles(start, end):
-    """The tiles a move from start to end goes through, start and end
-    included, in order along its straight line (two tiles the line runs
-    between both count, at the same point)."""
-    between = sorted(tiles_between(start, end), key=lambda c: (hex_distance(start, c), c))
-    return [start] + between + [end]
-
-
-def crossing(start, end, around):
-    """Where a move from start to end goes across (or past) the tile `around`:
-    the tile of the move it starts doing so from, or None if it doesn't.
-
-    It does if the move goes from a tile next to `around` to another tile
-    next to it, a single step round it included. With
-    config.TACKLE_MOVE_CHECK "ends" those are the move's start and end; with
-    "path" they're any two neighbouring tiles along the way."""
+def crossing(start, end, around, board=None):
+    """Where a move from start to end goes across (or past) the tile
+    `around`, or None. With a board, the move's clear routes are used and it
+    only counts if every one of them does (the tile of the first route's
+    crossing is returned); without one, any shortest route."""
     if start == end or around in (start, end):
         return None
-    near = set(neighbours(around))
-    if config.TACKLE_MOVE_CHECK == "ends":
-        return start if start in near and end in near else None
-    touching = [c for c in move_tiles(start, end) if c in near]
-    for i, a in enumerate(touching):
-        if any(hex_distance(a, b) == 1 for b in touching[i + 1:]):
-            return a
-    return None
+    options = shortest_routes(start, end) if board is None else routes(board, start, end)
+    points = [crossing_point(route, around) for route in options]
+    if not points or any(p is None for p in points):
+        return None
+    return points[0]
+
+
+def tackle_route(board, tile, player_to):
+    """(route taken, (carrier coord, chance) or None) for the player on tile
+    moving to player_to (without the ball). It's a tackle only if every clear
+    route crosses the opponent who has the ball; then the route used is the
+    one giving the lowest chance (TACKLE_CHANCE for the side the crossing
+    starts from, less the carrier's shield). Otherwise a route that goes
+    round. (None, None) if there's no clear route."""
+    options = routes(board, tile.coord, player_to, tile.player.team)
+    if not options:
+        return None, None
+    carrier = board.get(board.ball)
+    if (carrier is None or carrier.player is None or carrier is tile or player_to == tile.coord
+            or carrier.player.team == tile.player.team):
+        return options[0], None
+    best = None
+    for route in options:
+        at = crossing_point(route, carrier.coord)
+        if at is None:
+            return route, None                  # it can go round: no tackle
+        side = tackle_side(carrier.coord, carrier.player.facing, at)
+        chance = shielded(config.TACKLE_CHANCE[side], carrier.player)
+        if best is None or chance < best[1]:
+            best = (route, chance)
+    route, chance = best
+    return route, ((carrier.coord, chance) if chance > 0 else None)
 
 
 def moving_tackle(board, tile, player_to):
     """(carrier coord, chance) if the player on tile, moving to player_to,
-    goes across an opponent who has the ball; None if not or if the chance
-    is 0. The chance is TACKLE_CHANCE for the side of the carrier the move
-    starts crossing from, less the carrier's shield."""
-    carrier = board.get(board.ball)
-    if (carrier.player is None or carrier is tile or player_to == tile.coord
-            or carrier.player.team == tile.player.team):
-        return None
-    start = crossing(tile.coord, player_to, carrier.coord)
-    if start is None:
-        return None
-    side = tackle_side(carrier.coord, carrier.player.facing, start)
-    chance = shielded(config.TACKLE_CHANCE[side], carrier.player)
-    return (carrier.coord, chance) if chance > 0 else None
+    can't avoid going across the opponent who has the ball (see
+    tackle_route); None if they can, or if the chance is 0."""
+    return tackle_route(board, tile, player_to)[1]
 
 
-def carry_tackles(board, tile, player_to):
-    """((opponent coord, chance), ...) for the opponents a ball carrier on
-    tile goes past moving (with the ball) to player_to: those the move goes
-    from one tile next to to another (see crossing). In the order the move
-    passes them, best chance first when level. The chance is TACKLE_CHANCE
-    for the side of the carrier (facing as before the move) the opponent is
-    on where the move reaches them; shields don't count. 0% ones left out."""
-    player = tile.player
-    path = move_tiles(tile.coord, player_to)
-    order = {coord: i for i, coord in enumerate(path)}
-    nearby = {n for coord in path for n in neighbours(coord)} - set(path)
+def route_tackles(board, player, route):
+    """((opponent coord, chance), ...) for the opponents a ball carrier going
+    along route passes (steps from one tile next to them to another), in the
+    order passed, best chance first when level. TACKLE_CHANCE for the side
+    of the carrier (facing as before the move) the opponent is on; shields
+    don't count. 0% ones left out."""
+    order = {coord: i for i, coord in enumerate(route)}
+    nearby = {n for coord in route for n in neighbours(coord)} - set(route)
     found = []
     for coord in nearby:
         other = board.get(coord)
         if other is None or other.player is None or other.player.team == player.team:
             continue
-        at = crossing(tile.coord, player_to, coord)
+        at = crossing_point(route, coord)
         if at is None:
             continue
         chance = config.TACKLE_CHANCE[tackle_side(at, player.facing, coord)]
@@ -309,21 +379,68 @@ def carry_tackles(board, tile, player_to):
     return tuple((coord, chance) for _, _, coord, chance in sorted(found))
 
 
-def interceptions(board, team, start, end):
-    """((opponent coord, chance), ...) for a pass from start to end: one roll
-    of INTERCEPT_CHANCE for each tile the ball crosses (start and end not
-    counted) that each opponent stands next to, in order along the path."""
+def keep_chance(rolls):
+    keep = 1.0
+    for _, chance in rolls:
+        keep *= 1 - chance
+    return keep
+
+
+def carry_route(board, tile, player_to):
+    """(route, tackles) for a ball carrier on tile moving to player_to: the
+    clear route least likely to lose the ball (fewest tackles if level), and
+    the tackles of the opponents it passes (see route_tackles). (None, ())
+    if there's no clear route."""
+    best = None
+    for route in routes(board, tile.coord, player_to, tile.player.team):
+        tackles = route_tackles(board, tile.player, route)
+        key = (-keep_chance(tackles), len(tackles))
+        if best is None or key < best[0]:
+            best = (key, route, tackles)
+    return (None, ()) if best is None else (best[1], best[2])
+
+
+def carry_tackles(board, tile, player_to):
+    """The tackles a ball carrier on tile faces moving to player_to along
+    their safest route (see carry_route)."""
+    return carry_route(board, tile, player_to)[1]
+
+
+def route_interceptions(board, team, route):
+    """((opponent coord, chance), ...) for a pass along route: one roll of
+    INTERCEPT_CHANCE for each tile it crosses (start and end not counted)
+    that each opponent stands next to, in order along the route."""
     chance = config.INTERCEPT_CHANCE
     if chance <= 0:
         return ()
+    start, end = route[0], route[-1]
     rolls = []
-    for coord in sorted(tiles_between(start, end), key=lambda c: (hex_distance(start, c), c)):
+    for coord in route[1:-1]:
         for n in sorted(neighbours(coord)):
             tile = board.get(n)
             if (tile is not None and tile.player is not None and tile.player.team != team
                     and n not in (start, end)):
                 rolls.append((n, chance))
     return tuple(rolls)
+
+
+def pass_route(board, team, start, end):
+    """(route, interceptions) for a pass along the ground from start to end
+    by team: the clear route (through empty tiles or teammates) least likely
+    to be intercepted. (None, ()) if there's no clear route."""
+    best = None
+    for route in routes(board, start, end, team):
+        rolls = route_interceptions(board, team, route)
+        key = (-keep_chance(rolls), len(rolls))
+        if best is None or key < best[0]:
+            best = (key, route, rolls)
+    return (None, ()) if best is None else (best[1], best[2])
+
+
+def interceptions(board, team, start, end):
+    """The interception rolls of a pass from start to end along its safest
+    route (see pass_route)."""
+    return pass_route(board, team, start, end)[1]
 
 
 def keeper_save_chance(board, defending_team):
@@ -451,16 +568,25 @@ def outcomes(board, tile, action_name, check_requirements=True):
             keeper_at = board.keeper_tile(defending).coord if save > 0 else None
 
         carried, intercepts = (), ()
-        if follows and player_to != tile.coord and not hurdles:
-            # Carrying the ball past opponents
-            carried = carry_tackles(board, tile, player_to)
-        elif ball_to is not None and ball_to != tile.coord and not action.get("lofted", False):
-            intercepts = interceptions(board, player.team, tile.coord, ball_to)
+        route, ball_route = (), ()
         tackle_from, t_chance = None, 1.0
-        if not has_ball:
-            tackle = moving_tackle(board, tile, player_to)   # moving across the carrier
-            if tackle is not None:
-                tackle_from, t_chance = tackle
+        if player_to != tile.coord:
+            if follows and hurdles:
+                route = (tile.coord, player_to)         # over the top
+            elif follows:
+                # Carrying the ball past opponents, on the safest route
+                route, carried = carry_route(board, tile, player_to)
+            else:
+                route, tackle = tackle_route(board, tile, player_to)
+                if tackle is not None and not has_ball:     # moving across the carrier
+                    tackle_from, t_chance = tackle
+            if route is None:
+                continue                                # no clear route
+        if not follows and ball_to is not None and ball_to != tile.coord \
+                and not action.get("lofted", False):
+            ball_route, intercepts = pass_route(board, player.team, tile.coord, ball_to)
+            if ball_route is None:
+                continue
 
         # Moving ends a shield; a shielding action sets one after any movement
         shield = 0.0 if player_to != tile.coord else player.shield
@@ -468,7 +594,7 @@ def outcomes(board, tile, action_name, check_requirements=True):
             shield = max(shield, action["shield"])
 
         outcome = Outcome(player_to, facing, ball_to, tackle_from, t_chance, shot_at, s_chance,
-                          save, keeper_at, carried, intercepts, shield)
+                          save, keeper_at, carried, intercepts, shield, tuple(route), tuple(ball_route))
         if not changes_something(tile, outcome):
             if outcome.shield <= player.shield:
                 continue
@@ -697,8 +823,9 @@ def validate_config():
                 or not all(isinstance(v, int) and 0 <= v <= 255 for v in colour)):
             raise ValueError(f"config.DARK_MODE_COLOURS[{name!r}] must be (r, g, b) "
                              f"or (r, g, b, alpha) with values 0-255")
-    if config.TACKLE_MOVE_CHECK not in ("path", "ends"):
-        raise ValueError('config.TACKLE_MOVE_CHECK must be "path" or "ends"')
+    if hasattr(config, "TACKLE_MOVE_CHECK"):
+        print("Note: config.TACKLE_MOVE_CHECK isn't used any more (moves and passes use "
+              "their shortest routes). You can delete it.")
     if hasattr(config, "ZOC_TACKLE_CHANCE"):
         print("Note: config.ZOC_TACKLE_CHANCE isn't used any more (carriers can move straight "
               "away from opponents; going past one risks TACKLE_CHANCE). You can delete it.")
