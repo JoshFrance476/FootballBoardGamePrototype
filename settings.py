@@ -38,7 +38,7 @@ EDITABLE = [
 
 # Keys of an action, in the order they're written out
 ACTION_KEY_ORDER = ["requires", "self", "ball", "lofted", "turn", "face_movement",
-                    "shoot", "shield"]
+                    "shoot", "shield", "shove"]
 
 _saved = {}   # EDITABLE values as they are in config.py
 

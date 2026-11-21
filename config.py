@@ -244,6 +244,12 @@ SHOT_CHANCE = {
 #               which way the player faces, even if it moves them.
 #   An action can offer only one choice: a "self" list or a "ball" list, so
 #   one click always settles it.
+#   "shove":    True to push an opponent next to the player one tile straight
+#               back (the tile in line must be empty) and step into their
+#               place. Only when neither has the ball; click the opponent.
+#               The step can cross the opposing carrier (a tackle), and
+#               pushing someone across your own carrier gives them a tackle.
+#               Can't be combined with "self", "ball", "shoot" or "lofted".
 #   "shield":   an amount from 0 to 1 taken off the chance of an opponent
 #               tackling the player by moving across them, e.g. 0.3
 #               turns an 80% tackle into 50%. Lasts until the start of their
@@ -325,6 +331,10 @@ ACTIONS = {
         "requires": ["possession", "goalkeeper", "in_own_box"],
         "ball": [(1, 1), (2, -1), (3, -1), (2, 1), (2, -3), (-1, 3), (3, -2), (1, 2)],
     },
+    "shove": {                  # push a neighbouring opponent straight back a tile and take their place
+        "shove": True,
+        "face_movement": True,
+    },
     "shield": {                 # protect the ball: tackles on you are less likely until your next turn
         "requires": ["possession"],
         "shield": 0.2,
@@ -361,7 +371,7 @@ FACING_HALF_WIDTH = 6  # half the width of the back edge
 # Add "facing": RIGHT or LEFT to an entry to override TEAM_FACING, and
 # "role": "goalkeeper" for a keeper.
 OUTFIELD_ACTIONS = ["reposition", "dribble", "sprint", "pass", "lob", "pass and move",
-                    "backheel", "shoot", "shield", "cross"]
+                    "backheel", "shoot", "shield", "cross", "shove"]
 KEEPER_ACTIONS = ["reposition", "pass", "drop-kick", "throw"]
 
 # Most actions any one player can have, counting DEFAULT_ACTIONS (0 = no limit).

@@ -11,6 +11,15 @@ which happen in this order:
                         the side they moved towards, like the free step.
                         Actions never change a player's facing otherwise.
   - shooting            ("shoot":  True)  shoot at the goal the team attacks
+  - shoving             ("shove": True)  push an opponent next to the player
+                        one tile straight back (the tile in line with the
+                        push must be empty) and step into their tile. Only
+                        if neither of them has the ball. Click the opponent.
+                        The shover's step can cross the opposing ball
+                        carrier (a tackle, as for any move), and the shoved
+                        player being pushed across the shover's own carrier
+                        gives them a tackle. The shoved player keeps their
+                        facing and loses any shield.
   - shielding           ("shield": amount)  tackles on the player by
                         opponents moving across them have this much less
                         chance, e.g. 0.3 takes 80% down to 50%, until the
@@ -163,6 +172,9 @@ class Outcome:
     shield: float = 0.0                  # the player's shield afterwards
     route: tuple = ()                    # the player's route, start to end, if they move
     ball_route: tuple = ()               # the ball's route if it's passed along the ground
+    shoved: Optional[tuple] = None       # the opponent shoved (a shove action), and...
+    shove_to: Optional[tuple] = None     # ...where they're pushed to
+    push_tackle: Optional[tuple] = None  # (carrier, chance): pushed across the shover's carrier
 
     @property
     def score_chance(self):
@@ -379,6 +391,50 @@ def route_tackles(board, player, route):
     return tuple((coord, chance) for _, _, coord, chance in sorted(found))
 
 
+def push_tackle(board, shoved_tile, shove_to):
+    """(carrier coord, chance) if pushing the player on shoved_tile to
+    shove_to carries them across the opposing ball carrier (the shover's
+    teammate): they get a tackle, TACKLE_CHANCE for the side they start on,
+    less the carrier's shield. None if not, or the chance is 0."""
+    carrier = board.get(board.ball)
+    if (carrier is None or carrier.player is None or carrier is shoved_tile
+            or carrier.player.team == shoved_tile.player.team):
+        return None
+    at = crossing_point((shoved_tile.coord, shove_to), carrier.coord)
+    if at is None:
+        return None
+    side = tackle_side(carrier.coord, carrier.player.facing, at)
+    chance = shielded(config.TACKLE_CHANCE[side], carrier.player)
+    return (carrier.coord, chance) if chance > 0 else None
+
+
+def shove_outcomes(board, tile, action, facing_at):
+    """{opponent's coord: Outcome} for a shove action: every opponent next to
+    the player with an empty tile straight behind them (in line with the
+    push), when neither has the ball."""
+    player = tile.player
+    if board.has_possession(tile):
+        return {}
+    options = {}
+    q, r = tile.coord
+    for target in neighbours(tile.coord):
+        shoved = board.get(target)
+        if (shoved is None or shoved.player is None or shoved.player.team == player.team
+                or board.ball == target):
+            continue
+        behind = (2 * target[0] - q, 2 * target[1] - r)
+        if board.get(behind) is None or board.get(behind).player is not None:
+            continue
+        tackle = moving_tackle(board, tile, target)     # stepping across the opposing carrier
+        shield = action.get("shield", 0.0)
+        options[target] = Outcome(
+            target, facing_at(target), None,
+            tackle[0] if tackle else None, tackle[1] if tackle else 1.0,
+            shield=shield, route=(tile.coord, target), shoved=target, shove_to=behind,
+            push_tackle=push_tackle(board, shoved, behind))
+    return options
+
+
 def keep_chance(rolls):
     keep = 1.0
     for _, chance in rolls:
@@ -547,6 +603,9 @@ def outcomes(board, tile, action_name, check_requirements=True):
             return facing_after_move(tile.coord, player_to, player.facing)
         return player.facing
 
+    if action.get("shove"):
+        return shove_outcomes(board, tile, action, facing_at)
+
     options = {}
     for player_to, ball_to in product(player_tos, ball_tos):
         facing = facing_at(player_to)
@@ -615,6 +674,8 @@ def changes_something(tile, outcome):
 
 def click_target(board, tile, outcome, choice):
     """The tile the player clicks to pick this outcome, or None if it can't be clicked."""
+    if outcome.shoved is not None:
+        return outcome.shoved                       # the opponent being shoved
     if choice == "self":
         return outcome.player_to                    # where the player goes
     if choice == "ball":
@@ -641,6 +702,12 @@ def apply_outcome(board, tile, outcome, roll=random.random):
     """
     messages = []
 
+    # Shoving: the opponent is pushed back first, then the shover steps in
+    if outcome.shoved is not None:
+        board.move_player(board.get(outcome.shoved), board.get(outcome.shove_to))
+        board.get(outcome.shove_to).player.shield = 0.0     # being moved ends a shield
+        messages.append("Shoved")
+
     # Moving across the carrier: the player goes where they were going either way
     tackle_won = False
     if outcome.tackle_from is not None:
@@ -648,8 +715,18 @@ def apply_outcome(board, tile, outcome, roll=random.random):
         messages.append(f"Tackle {'won' if tackle_won else 'failed'} "
                         f"({percent(outcome.tackle_chance)})")
 
-    # Carrying the ball past opponents: each gets a tackle, in order
+    # Pushed across the shover's carrier: the shoved player gets a tackle
     lost = False
+    if outcome.push_tackle is not None:
+        chance = outcome.push_tackle[1]
+        if roll() < chance:
+            board.ball = outcome.shove_to
+            lost = True
+            messages.append(f"Pushed across your carrier and won the ball ({percent(chance)})")
+        else:
+            messages.append(f"Pushed across your carrier, tackle failed ({percent(chance)})")
+
+    # Carrying the ball past opponents: each gets a tackle, in order
     for coord, chance in outcome.carry_tackles:
         if roll() < chance:
             board.ball = coord
@@ -712,6 +789,10 @@ def dice_branches(outcome):
         p = outcome.tackle_chance
         branches = ([(q * p, rolls + [WIN]) for q, rolls in branches]
                     + [(q * (1 - p), rolls + [LOSE]) for q, rolls in branches])
+    if outcome.push_tackle is not None:
+        p = outcome.push_tackle[1]
+        branches = ([(q * p, rolls + [WIN]) for q, rolls in branches]
+                    + [(q * (1 - p), rolls + [LOSE]) for q, rolls in branches])
     for _, p in outcome.carry_tackles:
         failed += [(q * p, rolls + [WIN]) for q, rolls in branches]
         branches = [(q * (1 - p), rolls + [LOSE]) for q, rolls in branches]
@@ -733,8 +814,8 @@ def dice_branches(outcome):
 # --- Config checking ---
 
 ACTION_KEYS = {"requires", "self", "ball", "lofted", "turn", "face_movement", "shoot",
-               "shield"}
-EFFECT_KEYS = ("self", "ball", "turn", "shoot", "shield")
+               "shield", "shove"}
+EFFECT_KEYS = ("self", "ball", "turn", "shoot", "shield", "shove")
 
 
 def validate_config():
@@ -793,7 +874,13 @@ def validate_config():
                              f"only one of a 'self' list or a 'ball' list is allowed")
         if action.get("turn") and action.get("face_movement"):
             raise ValueError(f"{where} has both 'turn' and 'face_movement'; pick one")
-        for key in ("shoot", "lofted", "turn", "face_movement"):
+        if action.get("shove"):
+            mixed = [key for key in ("self", "ball", "shoot", "lofted") if key in action]
+            if mixed:
+                raise ValueError(f"{where} shoves, so it can't also have {mixed}: the shove "
+                                 f"decides where the player goes (it can turn, face the way "
+                                 f"it moved, or shield)")
+        for key in ("shoot", "lofted", "turn", "face_movement", "shove"):
             if key in action and not isinstance(action[key], bool):
                 raise ValueError(f"{where}[{key!r}] must be True or False")
         if "shield" in action and (isinstance(action["shield"], bool)

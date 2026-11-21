@@ -635,7 +635,7 @@ def is_pure_turn(action_name):
     key = (action_name, id(action))
     if key not in _pure_turn_cache:
         _pure_turn_cache[key] = bool(action.get("turn")) and not any(
-            action.get(k) for k in ("self", "ball", "shoot"))
+            action.get(k) for k in ("self", "ball", "shoot", "shove"))
     return _pure_turn_cache[key]
 
 
@@ -731,7 +731,7 @@ def may_roll(action_name):
     action = config.ACTIONS[action_name]
     if action.get("shoot"):
         return True
-    if "self" in action and any(config.TACKLE_CHANCE.values()):
+    if ("self" in action or action.get("shove")) and any(config.TACKLE_CHANCE.values()):
         return True             # moving across the carrier, or past opponents with the ball
     if action.get("lofted") or action.get("ball") == WITH_PLAYER:
         return False

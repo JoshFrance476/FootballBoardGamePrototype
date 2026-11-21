@@ -602,7 +602,7 @@ class ActionsScreen(Screen):
 
     REQUIRE_LABELS = {"possession": "Has the ball", "no_possession": "Without ball",
                       "goalkeeper": "Goalkeeper", "in_own_box": "In own box"}
-    EFFECT_LABELS = [("shoot", "Shoot"), ("lofted", "Lofted"),
+    EFFECT_LABELS = [("shoot", "Shoot"), ("lofted", "Lofted"), ("shove", "Shove"),
                      ("turn", "Turn"), ("face_movement", "Face move")]
     GIVEN_TO = [("OUTFIELD_ACTIONS", "Outfield"), ("KEEPER_ACTIONS", "Keepers"),
                 ("DEFAULT_ACTIONS", "Everyone")]

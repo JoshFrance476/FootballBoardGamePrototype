@@ -447,6 +447,8 @@ class Game:
             threats = [c for c, _ in outcome.carry_tackles + outcome.intercepts]
             if outcome.tackle_from is not None:
                 threats.append(outcome.tackle_from)
+            if outcome.push_tackle is not None:
+                threats.append(outcome.push_tackle[0])
             if not threats:
                 return None
             return {"route_tiles": outcome.route[1:-1], "ball_tiles": outcome.ball_route[1:-1],
@@ -535,6 +537,9 @@ def chance_lines(outcome, show_safe=False):
     lines = []
     if outcome.tackle_from is not None:
         lines.append(f"Tackle: {percent(outcome.tackle_chance)} to win the ball")
+    if outcome.push_tackle is not None:
+        lines.append(f"Pushes them across your carrier: {percent(outcome.push_tackle[1])} "
+                     f"they win the ball")
     if outcome.carry_tackles:
         lines += past_lines(outcome.carry_tackles)
     if outcome.intercepts:
