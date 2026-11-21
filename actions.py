@@ -2,7 +2,6 @@
 
 An action (configured in config.ACTIONS) can combine any of these effects,
 which happen in this order:
-  - tackling            ("tackle": True)  take the ball from an adjacent opponent
   - moving the player   ("self":   offset or list of offsets)
   - moving the ball     ("ball":   offset or list of offsets, or "with_player"
                                    to go wherever the player moves; only
@@ -12,10 +11,10 @@ which happen in this order:
                         the side they moved towards, like the free step.
                         Actions never change a player's facing otherwise.
   - shooting            ("shoot":  True)  shoot at the goal the team attacks
-  - shielding           ("shield": amount)  tackles on the player (normal and
-                        zone of control) have this much less chance, e.g. 0.3
-                        takes 80% down to 50%, until the team's next turn
-                        starts or the player moves
+  - shielding           ("shield": amount)  tackles on the player by
+                        opponents moving across them have this much less
+                        chance, e.g. 0.3 takes 80% down to 50%, until the
+                        team's next turn starts or the player moves
 
 Offsets are written for a player facing right, measured from where the
 player stands before the action. For a player facing left they're mirrored
@@ -31,15 +30,25 @@ Player and ball moves can't pass through a tile with an opponent on it
 them too.
 Shots aren't blocked.
 
-Tackles and shots can fail. A failed tackle stops the rest of the action;
-a shot comes last, so nothing is left to stop.
+Tackling: there's no tackle action. A player tackles by moving across the
+opponent who has the ball: from a tile next to the carrier to another tile
+next to them (see crossing; a single step round them counts). The free step
+and any action that moves a player can do it. The chance is TACKLE_CHANCE
+for the side of the carrier the tackler starts from (front or behind, by the
+way the carrier faces), less the carrier's shield. Either way the tackler
+ends up where they were going: with the ball if the tackle wins.
 
-Zone of control: a player carrying the ball who moves to another tile (the
-free step, or an action moving them with the ball) gives every opponent next
-to them a free tackle first, with a chance from ZOC_TACKLE_CHANCE, best
-chance first. If one wins, the carrier stays put, the ball goes to that
-opponent and the rest of the action doesn't happen. A lofted carry (hurdle)
-escapes it.
+Going past: a carrier who moves past an opponent the same way (from a tile
+next to them to another tile next to them) gives that opponent a free
+tackle, with TACKLE_CHANCE for the side of the carrier the opponent is on.
+Shields don't count (moving ends them anyway). Each opponent passed gets one,
+in the order the move passes them; if one wins, the ball goes to them and the
+carrier still finishes the move, without it. A lofted carry (hurdle)
+escapes. Moving straight away from an opponent is safe.
+
+Long moves: with TACKLE_MOVE_CHECK = "path", every step along a move's
+straight line counts, so a two-tile run can cross or pass someone on the way;
+with "ends", only where the move starts and finishes.
 
 Interceptions: a pass that isn't lofted can be intercepted by any opponent
 next to a tile it crosses (not counting the start and destination tiles),
@@ -74,8 +83,13 @@ def config_defaults():
         "RANKING_TEAMS": 100, "RANKING_TOP_RATING": 2000, "RANKING_POINTS_PER_PLACE": 10,
         "RANKING_WIN_SHARE": 0.5, "RANKING_MIN_WIN": 10, "RANKING_DRAW_SHARE": 0.1,
         "RANKING_LOSS_MAX": 50, "RANKING_LOSS_HALF_GAP": 300,
-        "ZOC_TACKLE_CHANCE": {"front": 0.0, "behind": 0.0},   # 0 = no zone of control
-        "INTERCEPT_CHANCE": 0.0,                               # 0 = no interceptions
+        "TACKLE_MOVE_CHECK": "path",        # long moves tackle along every step ("ends": start/end only)
+        "TEXT_COLOUR": (0, 0, 0), "FAINT_TEXT_COLOUR": (140, 140, 140), "ERROR_COLOUR": (190, 0, 0),
+        "INPUT_COLOUR": (255, 255, 255), "STRIPE_COLOUR": (228, 228, 228),
+        "HIGHLIGHT_ROW_COLOUR": (255, 236, 160),
+        "DARK_MODE": False, "DARK_MODE_COLOURS": {}, "FULLSCREEN": False,
+        "AI_PROGRESS_STOP": None, "REPLAY_FOLDER": "replays",
+        "INTERCEPT_CHANCE": 0.0,            # 0 = no interceptions
         "MAX_PLAYER_ACTIONS": 0,            # 0 = no limit
         "SHIFTED_ROWS": "second",           # which rows sit half a tile across
         "PREVIEW_TARGET_COLOUR": (215, 215, 215),   # border on tiles a hovered action could reach
@@ -126,13 +140,13 @@ class Outcome:
     player_to: tuple                     # coordinate the player ends up on
     facing: int                          # direction the player faces afterwards
     ball_to: Optional[tuple]             # where the ball goes, or None if it doesn't move
-    tackle_from: Optional[tuple] = None  # ball carrier's coordinate, if this tackles
+    tackle_from: Optional[tuple] = None  # ball carrier's coordinate, if the move goes across them
     tackle_chance: float = 1.0
     shot_at: Optional[tuple] = None      # goal coordinate, if this shoots
     shot_chance: float = 1.0             # chance the shot is on target (beats everything but the keeper)
     save_chance: float = 0.0             # chance the defending keeper saves an on-target shot
     keeper_at: Optional[tuple] = None    # where that keeper stands (they catch a save)
-    zoc_tackles: tuple = ()              # ((opponent coord, chance), ...) tried as the carrier moves
+    carry_tackles: tuple = ()            # ((opponent coord, chance), ...) the carrier goes past, in order
     intercepts: tuple = ()               # ((opponent coord, chance), ...) along the pass, in order
     shield: float = 0.0                  # the player's shield afterwards
 
@@ -143,9 +157,9 @@ class Outcome:
 
     @property
     def loss_chance(self):
-        """Chance a zone of control tackle or an interception takes the ball."""
+        """Chance an opponent the carrier goes past, or an interception, takes the ball."""
         keep = 1.0
-        for _, chance in self.zoc_tackles + self.intercepts:
+        for _, chance in self.carry_tackles + self.intercepts:
             keep *= 1 - chance
         return 1 - keep
 
@@ -156,8 +170,8 @@ class Result:
     tile: object                     # the Tile the acting player is on afterwards
     message: str = ""                # what to tell the player, "" for nothing
     goal_for: Optional[int] = None   # the team that scored, if a goal went in
-    tackle_won: bool = False         # the action included a successful tackle
-    lost_ball: bool = False          # a zone of control tackle or interception took it
+    tackle_won: bool = False         # the player won the ball by moving across the carrier
+    lost_ball: bool = False          # an opponent they went past, or an interception, took it
 
 
 def percent(chance):
@@ -192,15 +206,6 @@ def meets_requirements(board, tile, action):
     return not requires or all(REQUIREMENTS[req](board, tile) for req in requires)
 
 
-def adjacent_ball_carrier(board, tile):
-    """The tile of an opponent next to this player who has the ball, or None."""
-    carrier = board.get(board.ball)
-    if (carrier.player is not None
-            and carrier.player.team != tile.player.team
-            and carrier.coord in neighbours(tile.coord)):
-        return carrier
-    return None
-
 
 def path_blocked(board, player, start, end):
     """True if an opponent of player stands anywhere along the straight line
@@ -218,31 +223,89 @@ def shielded(chance, player):
     return max(0.0, chance - player.shield)
 
 
+def tackle_side(carrier_coord, facing, other):
+    """"front" if the tile `other` (next to carrier_coord) is on the side a
+    carrier there facing `facing` faces, else "behind"."""
+    direction = neighbours(carrier_coord).index(other)
+    return "front" if is_in_front(facing, direction) else "behind"
+
+
 def tackle_chance(carrier, tackler):
-    """Chance of winning the ball: TACKLE_CHANCE["front"] if the tackler is on
-    the side the ball carrier is facing, TACKLE_CHANCE["behind"] if not, less
-    the carrier's shield."""
-    direction = neighbours(carrier.coord).index(tackler.coord)
-    side = "front" if is_in_front(carrier.player.facing, direction) else "behind"
+    """Chance a tackler next to the carrier (both Tiles) wins the ball by
+    moving across them from there: TACKLE_CHANCE for the side they start on,
+    less the carrier's shield."""
+    side = tackle_side(carrier.coord, carrier.player.facing, tackler.coord)
     return shielded(config.TACKLE_CHANCE[side], carrier.player)
 
 
-def zoc_tackles(board, carrier_tile, facing=None):
-    """((opponent coord, chance), ...) for the free tackles the opponents next
-    to carrier_tile get if the carrier moves away, best chance first. Chances
-    from ZOC_TACKLE_CHANCE by which side of the carrier (facing `facing`,
-    default their current facing) each opponent is on; 0% ones are left out."""
-    team = carrier_tile.player.team
-    facing = carrier_tile.player.facing if facing is None else facing
+def move_tiles(start, end):
+    """The tiles a move from start to end goes through, start and end
+    included, in order along its straight line (two tiles the line runs
+    between both count, at the same point)."""
+    between = sorted(tiles_between(start, end), key=lambda c: (hex_distance(start, c), c))
+    return [start] + between + [end]
+
+
+def crossing(start, end, around):
+    """Where a move from start to end goes across (or past) the tile `around`:
+    the tile of the move it starts doing so from, or None if it doesn't.
+
+    It does if the move goes from a tile next to `around` to another tile
+    next to it, a single step round it included. With
+    config.TACKLE_MOVE_CHECK "ends" those are the move's start and end; with
+    "path" they're any two neighbouring tiles along the way."""
+    if start == end or around in (start, end):
+        return None
+    near = set(neighbours(around))
+    if config.TACKLE_MOVE_CHECK == "ends":
+        return start if start in near and end in near else None
+    touching = [c for c in move_tiles(start, end) if c in near]
+    for i, a in enumerate(touching):
+        if any(hex_distance(a, b) == 1 for b in touching[i + 1:]):
+            return a
+    return None
+
+
+def moving_tackle(board, tile, player_to):
+    """(carrier coord, chance) if the player on tile, moving to player_to,
+    goes across an opponent who has the ball; None if not or if the chance
+    is 0. The chance is TACKLE_CHANCE for the side of the carrier the move
+    starts crossing from, less the carrier's shield."""
+    carrier = board.get(board.ball)
+    if (carrier.player is None or carrier is tile or player_to == tile.coord
+            or carrier.player.team == tile.player.team):
+        return None
+    start = crossing(tile.coord, player_to, carrier.coord)
+    if start is None:
+        return None
+    side = tackle_side(carrier.coord, carrier.player.facing, start)
+    chance = shielded(config.TACKLE_CHANCE[side], carrier.player)
+    return (carrier.coord, chance) if chance > 0 else None
+
+
+def carry_tackles(board, tile, player_to):
+    """((opponent coord, chance), ...) for the opponents a ball carrier on
+    tile goes past moving (with the ball) to player_to: those the move goes
+    from one tile next to to another (see crossing). In the order the move
+    passes them, best chance first when level. The chance is TACKLE_CHANCE
+    for the side of the carrier (facing as before the move) the opponent is
+    on where the move reaches them; shields don't count. 0% ones left out."""
+    player = tile.player
+    path = move_tiles(tile.coord, player_to)
+    order = {coord: i for i, coord in enumerate(path)}
+    nearby = {n for coord in path for n in neighbours(coord)} - set(path)
     found = []
-    for direction, coord in enumerate(neighbours(carrier_tile.coord)):
-        tile = board.get(coord)
-        if tile is not None and tile.player is not None and tile.player.team != team:
-            side = "front" if is_in_front(facing, direction) else "behind"
-            chance = shielded(config.ZOC_TACKLE_CHANCE[side], carrier_tile.player)
-            if chance > 0:
-                found.append((coord, chance))
-    return tuple(sorted(found, key=lambda item: (-item[1], item[0])))
+    for coord in nearby:
+        other = board.get(coord)
+        if other is None or other.player is None or other.player.team == player.team:
+            continue
+        at = crossing(tile.coord, player_to, coord)
+        if at is None:
+            continue
+        chance = config.TACKLE_CHANCE[tackle_side(at, player.facing, coord)]
+        if chance > 0:
+            found.append((order[at], -chance, coord, chance))
+    return tuple((coord, chance) for _, _, coord, chance in sorted(found))
 
 
 def interceptions(board, team, start, end):
@@ -308,7 +371,7 @@ def preview_outcomes(board, tile, action_name):
     uses_ball = ("ball" in action or action.get("shoot")
                  or "possession" in action.get("requires", []))
     saved = board.ball
-    if uses_ball and not action.get("tackle"):
+    if uses_ball:
         board.ball = tile.coord
     try:
         return outcomes(board, tile, action_name, check_requirements=False)
@@ -319,8 +382,8 @@ def preview_outcomes(board, tile, action_name):
 def outcomes(board, tile, action_name, check_requirements=True):
     """{clickable coordinate: Outcome} for the player on this tile.
 
-    Empty if the action can't be used: a requirement fails, a tackle has no
-    adjacent opponent with the ball, or no option is valid. An option is
+    Empty if the action can't be used: a requirement fails, or no option is
+    valid. An option is
     invalid if the player or ball would end up off the board, the player
     would land on someone, or a shot would be out of range or made without
     the ball at the player's feet.
@@ -333,16 +396,6 @@ def outcomes(board, tile, action_name, check_requirements=True):
 
     has_ball = board.has_possession(tile)
     ball_start = None               # where the ball is moved before any "ball" offset
-    tackle_from, t_chance = None, 1.0
-    if action.get("tackle"):
-        carrier = adjacent_ball_carrier(board, tile)
-        if carrier is None:
-            return {}
-        tackle_from, t_chance = carrier.coord, tackle_chance(carrier, tile)
-        if t_chance <= 0:
-            return {}               # a 0% tackle (e.g. from behind) isn't offered
-        has_ball = True
-        ball_start = tile.coord     # the ball comes to the tackler's tile
 
     follows = action.get("ball") == WITH_PLAYER and has_ball   # ball goes where the player goes
     # A lofted ball carried by the player: player and ball go over opponents
@@ -396,12 +449,17 @@ def outcomes(board, tile, action_name, check_requirements=True):
             save = keeper_save_chance(board, defending)
             keeper_at = board.keeper_tile(defending).coord if save > 0 else None
 
-        zoc, intercepts = (), ()
+        carried, intercepts = (), ()
         if follows and player_to != tile.coord and not hurdles:
-            # Carrying the ball away from opponents next to the player
-            zoc = zoc_tackles(board, tile)
+            # Carrying the ball past opponents
+            carried = carry_tackles(board, tile, player_to)
         elif ball_to is not None and ball_to != tile.coord and not action.get("lofted", False):
             intercepts = interceptions(board, player.team, tile.coord, ball_to)
+        tackle_from, t_chance = None, 1.0
+        if not has_ball:
+            tackle = moving_tackle(board, tile, player_to)   # moving across the carrier
+            if tackle is not None:
+                tackle_from, t_chance = tackle
 
         # Moving ends a shield; a shielding action sets one after any movement
         shield = 0.0 if player_to != tile.coord else player.shield
@@ -409,7 +467,7 @@ def outcomes(board, tile, action_name, check_requirements=True):
             shield = max(shield, action["shield"])
 
         outcome = Outcome(player_to, facing, ball_to, tackle_from, t_chance, shot_at, s_chance,
-                          save, keeper_at, zoc, intercepts, shield)
+                          save, keeper_at, carried, intercepts, shield)
         if not changes_something(tile, outcome):
             if outcome.shield <= player.shield:
                 continue
@@ -437,8 +495,6 @@ def click_target(board, tile, outcome, choice):
     faced = neighbours(outcome.player_to)[outcome.facing]
 
     # Fixed action: one tile to click to confirm it
-    if outcome.tackle_from is not None:
-        return outcome.tackle_from                  # the player being tackled
     if outcome.player_to != tile.coord:
         return outcome.player_to
     if outcome.shot_at is not None:
@@ -458,23 +514,26 @@ def apply_outcome(board, tile, outcome, roll=random.random):
     """
     messages = []
 
+    # Moving across the carrier: the player goes where they were going either way
+    tackle_won = False
     if outcome.tackle_from is not None:
-        if roll() >= outcome.tackle_chance:
-            return Result(tile, f"Tackle failed ({percent(outcome.tackle_chance)})")
-        messages.append(f"Tackle won ({percent(outcome.tackle_chance)})")
-    tackle_won = outcome.tackle_from is not None
+        tackle_won = roll() < outcome.tackle_chance
+        messages.append(f"Tackle {'won' if tackle_won else 'failed'} "
+                        f"({percent(outcome.tackle_chance)})")
 
-    # Moving away with the ball: each adjacent opponent gets a free tackle first
-    for coord, chance in outcome.zoc_tackles:
+    # Carrying the ball past opponents: each gets a tackle, in order
+    lost = False
+    for coord, chance in outcome.carry_tackles:
         if roll() < chance:
             board.ball = coord
-            messages.append(f"Tackled moving away ({percent(chance)})")
-            return Result(tile, " - ".join(messages), tackle_won=tackle_won, lost_ball=True)
-    if outcome.zoc_tackles:
-        messages.append("Got away from the tackle" + ("s" if len(outcome.zoc_tackles) > 1 else ""))
+            lost = True
+            messages.append(f"Tackled going past ({percent(chance)})")
+            break
+    if outcome.carry_tackles and not lost:
+        messages.append("Got past the tackle" + ("s" if len(outcome.carry_tackles) > 1 else ""))
 
     intercepted = False
-    if outcome.ball_to is not None:
+    if outcome.ball_to is not None and not lost:
         board.ball = outcome.ball_to
         for coord, chance in outcome.intercepts:
             if roll() < chance:
@@ -486,12 +545,14 @@ def apply_outcome(board, tile, outcome, roll=random.random):
     old_shield = tile.player.shield
     if destination is not tile:
         board.move_player(tile, destination)
+    if tackle_won:
+        board.ball = destination.coord
     destination.player.facing = outcome.facing
     destination.player.shield = outcome.shield
     if outcome.shield > old_shield or (outcome.shield and destination is not tile):
         messages.append(f"Shielding: -{round(outcome.shield * 100)} points on tackles")
 
-    if outcome.shot_at is not None and not intercepted:
+    if outcome.shot_at is not None and not intercepted and not lost:
         if roll() >= outcome.shot_chance:
             board.ball = outcome.shot_at        # missed: loose on the goal tile
             messages.append(f"Shot missed ({percent(outcome.shot_chance)} on target)")
@@ -504,7 +565,8 @@ def apply_outcome(board, tile, outcome, roll=random.random):
             return Result(destination, " - ".join(messages), goal_for=destination.player.team,
                           tackle_won=tackle_won)
 
-    return Result(destination, " - ".join(messages), tackle_won=tackle_won, lost_ball=intercepted)
+    return Result(destination, " - ".join(messages), tackle_won=tackle_won,
+                  lost_ball=intercepted or lost)
 
 
 WIN, LOSE = 0.0, 0.999999   # dice rolls that make a chance succeed / fail
@@ -512,17 +574,18 @@ WIN, LOSE = 0.0, 0.999999   # dice rolls that make a chance succeed / fail
 
 def dice_branches(outcome):
     """[(probability, rolls)] for every way an outcome's dice can fall, in the
-    order apply_outcome rolls them: tackle (failing stops the action), the
-    zone of control tackles (one winning stops it), interceptions (the first
+    order apply_outcome rolls them: a tackle by moving across the carrier
+    (won or not, the move goes on), the tackles by opponents the carrier
+    goes past (one winning ends the ball's part), interceptions (the first
     success ends them), shot on target, then the keeper's save. Pass the
     rolls (via a scripted roll function) to reproduce that branch exactly."""
     branches = [(1.0, [])]
-    failed = []                 # branches where the action stopped early
+    failed = []                 # branches where the ball was lost on the way
     if outcome.tackle_from is not None:
         p = outcome.tackle_chance
-        failed = [(q * (1 - p), rolls + [LOSE]) for q, rolls in branches]
-        branches = [(q * p, rolls + [WIN]) for q, rolls in branches]
-    for _, p in outcome.zoc_tackles:
+        branches = ([(q * p, rolls + [WIN]) for q, rolls in branches]
+                    + [(q * (1 - p), rolls + [LOSE]) for q, rolls in branches])
+    for _, p in outcome.carry_tackles:
         failed += [(q * p, rolls + [WIN]) for q, rolls in branches]
         branches = [(q * (1 - p), rolls + [LOSE]) for q, rolls in branches]
     for _, p in outcome.intercepts:
@@ -542,9 +605,9 @@ def dice_branches(outcome):
 
 # --- Config checking ---
 
-ACTION_KEYS = {"requires", "tackle", "self", "ball", "lofted", "turn", "face_movement", "shoot",
+ACTION_KEYS = {"requires", "self", "ball", "lofted", "turn", "face_movement", "shoot",
                "shield"}
-EFFECT_KEYS = ("tackle", "self", "ball", "turn", "shoot", "shield")
+EFFECT_KEYS = ("self", "ball", "turn", "shoot", "shield")
 
 
 def validate_config():
@@ -570,6 +633,11 @@ def validate_config():
             raise ValueError(f"{where} has a 'cost', but action points are gone: each turn "
                              f"now has free steps plus one action (two with the ball). "
                              f"Remove 'cost'.")
+        if "tackle" in action:
+            raise ValueError(f"{where} has 'tackle', but there's no tackle action any more: "
+                             f"players tackle by moving across the opponent with the ball. "
+                             f"Remove the action (or its 'tackle' key), and take it out of "
+                             f"any player's action list.")
         unknown = set(action) - ACTION_KEYS
         if unknown:
             raise ValueError(f"{where} has unknown keys {sorted(unknown)}; "
@@ -598,7 +666,7 @@ def validate_config():
                              f"only one of a 'self' list or a 'ball' list is allowed")
         if action.get("turn") and action.get("face_movement"):
             raise ValueError(f"{where} has both 'turn' and 'face_movement'; pick one")
-        for key in ("tackle", "shoot", "lofted", "turn", "face_movement"):
+        for key in ("shoot", "lofted", "turn", "face_movement"):
             if key in action and not isinstance(action[key], bool):
                 raise ValueError(f"{where}[{key!r}] must be True or False")
         if "shield" in action and (isinstance(action["shield"], bool)
@@ -612,9 +680,28 @@ def validate_config():
 
     if set(config.TACKLE_CHANCE) != set(TACKLE_ANGLES):
         raise ValueError(f"config.TACKLE_CHANCE needs exactly the keys {TACKLE_ANGLES}")
-    if set(config.ZOC_TACKLE_CHANCE) != set(TACKLE_ANGLES):
-        raise ValueError(f"config.ZOC_TACKLE_CHANCE needs exactly the keys {TACKLE_ANGLES}")
-    for table in ("TACKLE_CHANCE", "SHOT_CHANCE", "ZOC_TACKLE_CHANCE"):
+    if config.AI_PROGRESS_STOP is not None and (
+            not isinstance(config.AI_PROGRESS_STOP, int) or config.AI_PROGRESS_STOP < 1):
+        raise ValueError("config.AI_PROGRESS_STOP must be None or a whole number, 1 or more")
+    if not isinstance(config.FULLSCREEN, bool):
+        raise ValueError("config.FULLSCREEN must be True or False")
+    if not isinstance(config.DARK_MODE, bool):
+        raise ValueError("config.DARK_MODE must be True or False")
+    if not isinstance(config.DARK_MODE_COLOURS, dict):
+        raise ValueError("config.DARK_MODE_COLOURS must be a dict of colour name -> (r, g, b)")
+    for name, colour in config.DARK_MODE_COLOURS.items():
+        if not hasattr(config, name):
+            raise ValueError(f"config.DARK_MODE_COLOURS: there's no colour called {name} in config")
+        if (not isinstance(colour, tuple) or len(colour) not in (3, 4)
+                or not all(isinstance(v, int) and 0 <= v <= 255 for v in colour)):
+            raise ValueError(f"config.DARK_MODE_COLOURS[{name!r}] must be (r, g, b) "
+                             f"or (r, g, b, alpha) with values 0-255")
+    if config.TACKLE_MOVE_CHECK not in ("path", "ends"):
+        raise ValueError('config.TACKLE_MOVE_CHECK must be "path" or "ends"')
+    if hasattr(config, "ZOC_TACKLE_CHANCE"):
+        print("Note: config.ZOC_TACKLE_CHANCE isn't used any more (carriers can move straight "
+              "away from opponents; going past one risks TACKLE_CHANCE). You can delete it.")
+    for table in ("TACKLE_CHANCE", "SHOT_CHANCE"):
         for key, value in getattr(config, table).items():
             if not is_chance(value):
                 raise ValueError(f"config.{table}[{key!r}] must be a chance from 0 to 1")

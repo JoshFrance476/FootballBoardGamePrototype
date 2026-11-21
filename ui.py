@@ -10,11 +10,24 @@ import pygame
 import config
 
 TITLE_SIZE = 40
-TEXT_COLOUR = config.BLACK
-FAINT_TEXT_COLOUR = config.MID_GREY
-ERROR_COLOUR = (190, 0, 0)
-PANEL_COLOUR = (235, 235, 235)
 ROW_HEIGHT = 34
+MOUSE_OFFSET = (0, 0)   # where the game sits in the window (set by main.App when fullscreen)
+
+
+def mouse_pos():
+    """The mouse position on the game (not the window)."""
+    x, y = pygame.mouse.get_pos()
+    return x - MOUSE_OFFSET[0], y - MOUSE_OFFSET[1]
+
+# ui.TEXT_COLOUR etc. read the current config colour (so dark mode applies)
+_COLOUR_NAMES = {"TEXT_COLOUR": "TEXT_COLOUR", "FAINT_TEXT_COLOUR": "FAINT_TEXT_COLOUR",
+                 "ERROR_COLOUR": "ERROR_COLOUR", "PANEL_COLOUR": "FULL_TIME_PANEL_COLOUR"}
+
+
+def __getattr__(name):
+    if name in _COLOUR_NAMES:
+        return getattr(config, _COLOUR_NAMES[name])
+    raise AttributeError(f"module 'ui' has no attribute {name!r}")
 
 _fonts = {}
 
@@ -28,17 +41,18 @@ def font(size=None, bold=False):
     return _fonts[key]
 
 
-def text(screen, string, pos, size=None, colour=TEXT_COLOUR, anchor="topleft", bold=False):
-    """Draw a line of text; returns its rect."""
-    surface = font(size, bold).render(string, True, colour)
+def text(screen, string, pos, size=None, colour=None, anchor="topleft", bold=False):
+    """Draw a line of text (default colour config.TEXT_COLOUR); returns its rect."""
+    surface = font(size, bold).render(string, True, colour or config.TEXT_COLOUR)
     rect = surface.get_rect(**{anchor: pos})
     screen.blit(surface, rect)
     return rect
 
 
-def wrapped(screen, string, rect, size=None, colour=TEXT_COLOUR):
+def wrapped(screen, string, rect, size=None, colour=None):
     """Draw text word-wrapped inside rect (lines that don't fit are dropped)."""
     f = font(size)
+    colour = colour or config.TEXT_COLOUR
     y = rect.top
     for paragraph in string.split("\n"):
         line = ""
@@ -141,7 +155,7 @@ class Stepper:
 
     def draw(self, screen):
         enabled = self.enabled()
-        colour = TEXT_COLOUR if enabled else FAINT_TEXT_COLOUR
+        colour = config.TEXT_COLOUR if enabled else config.FAINT_TEXT_COLOUR
         text(screen, self.label, (self.rect.left, self.rect.centery), colour=colour,
              anchor="midleft")
         value = self.get()
@@ -179,7 +193,7 @@ class Choice:
         enabled = self.enabled()
         if self.label:
             text(screen, self.label, (self.rect.left, self.rect.centery),
-                 colour=TEXT_COLOUR if enabled else FAINT_TEXT_COLOUR, anchor="midleft")
+                 colour=config.TEXT_COLOUR if enabled else config.FAINT_TEXT_COLOUR, anchor="midleft")
         current = self.get()
         for value, name, rect in self.buttons:
             draw_box(screen, rect, name, *colours(enabled, value == current))
@@ -231,7 +245,7 @@ class TextBox:
             self.on_submit(self.draft)
 
     def draw(self, screen):
-        pygame.draw.rect(screen, config.WHITE, self.rect, border_radius=4)
+        pygame.draw.rect(screen, config.INPUT_COLOUR, self.rect, border_radius=4)
         pygame.draw.rect(screen, config.BUTTON_ACTIVE_COLOUR if self.editing else config.MID_GREY,
                          self.rect, 2, border_radius=4)
         shown = self.draft + "|" if self.editing else self.get()

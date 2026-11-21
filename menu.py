@@ -7,6 +7,7 @@ permanent; Revert to config.py throws them away.
 """
 import contextlib
 import io
+import math
 import time
 
 import pygame
@@ -14,7 +15,9 @@ import pygame
 import actions as actions_module
 import config
 import ranking as ranking_module
+import replay as replay_module
 import settings
+import theme
 import ui
 from ai import AIController
 from board import Board
@@ -109,7 +112,7 @@ class MainMenu(Screen):
         super().__init__(app)
         self.message = ""
         self.error, self.notes = None, []
-        w, h, gap = 280, 36, 6
+        w, h, gap = 280, 34, 5
         x, y = (WIDTH - w) // 2, 84
 
         def row(i):
@@ -118,15 +121,18 @@ class MainMenu(Screen):
         self.widgets = [
             ui.Button(row(0), "Play", self.play, enabled=lambda: self.error is None),
             ui.Button(row(1), "Rankings", lambda: app.push(RankingsScreen(app))),
-            ui.Button(row(2), "Match settings", lambda: app.push(MatchScreen(app))),
-            ui.Button(row(3), "Pitch and rules", lambda: app.push(RulesScreen(app))),
-            ui.Button(row(4), "Formation", lambda: app.push(FormationScreen(app))),
-            ui.Button(row(5), "Actions", lambda: app.push(ActionsScreen(app))),
-            ui.Button(row(6), "Save to config.py", self.save,
+            ui.Button(row(2), "Replays", lambda: app.push(ReplayListScreen(app))),
+            ui.Button(row(3), "Match settings", lambda: app.push(MatchScreen(app))),
+            ui.Button(row(4), "Pitch and rules", lambda: app.push(RulesScreen(app))),
+            ui.Button(row(5), "Formation", lambda: app.push(FormationScreen(app))),
+            ui.Button(row(6), "Actions", lambda: app.push(ActionsScreen(app))),
+            ui.Button(row(7), "Save to config.py", self.save,
                       enabled=lambda: self.error is None and settings.has_unsaved_changes()),
-            Confirm(row(7), "Revert to config.py", "Click again to revert", self.revert,
+            Confirm(row(8), "Revert to config.py", "Click again to revert", self.revert,
                     enabled=settings.has_unsaved_changes),
-            ui.Button(row(8), "Quit", app.quit),
+            ui.Button(row(9), "Quit", app.quit),
+            dark_mode_button((WIDTH - 170, 20, 150, 34)),
+            fullscreen_button(app, (WIDTH - 170, 60, 150, 34)),
         ]
 
     def back(self):
@@ -255,10 +261,9 @@ class RulesScreen(Screen):
                        self.set_box_radius, 1, 0, 4),
             chance_stepper((left_x, 200, left_w, h), "Tackle from the front", config.TACKLE_CHANCE, "front"),
             chance_stepper((left_x, 234, left_w, h), "Tackle from behind", config.TACKLE_CHANCE, "behind"),
-            chance_stepper((left_x, 268, left_w, h), "Moving away: tackle from front",
-                           config.ZOC_TACKLE_CHANCE, "front"),
-            chance_stepper((left_x, 302, left_w, h), "Moving away: tackle from behind",
-                           config.ZOC_TACKLE_CHANCE, "behind"),
+            ui.Choice((left_x, 268, left_w, h), "Long moves tackle on",
+                      [("path", "Every step"), ("ends", "Start + end")],
+                      lambda: config.TACKLE_MOVE_CHECK, self.set_move_check, option_width=100),
             ui.Stepper((left_x, 336, left_w, h), "Interception, per tile passed",
                        lambda: config.INTERCEPT_CHANCE, intercept_setter, 0.05, 0.0, 1.0, percent),
             ui.Stepper((right_x, 128, right_w, h), "Starting a turn with the ball",
@@ -293,6 +298,11 @@ class RulesScreen(Screen):
             ui.Button((WIDTH - 140, HEIGHT - 50, 120, 40), "Back", self.back),
         ]
         self.widgets = widgets
+
+    @staticmethod
+    def set_move_check(value):
+        config.TACKLE_MOVE_CHECK = value
+        settings.changed()
 
     @staticmethod
     def count_setter(name):
@@ -598,7 +608,7 @@ class ActionsScreen(Screen):
 
     REQUIRE_LABELS = {"possession": "Has the ball", "no_possession": "Without ball",
                       "goalkeeper": "Goalkeeper", "in_own_box": "In own box"}
-    EFFECT_LABELS = [("tackle", "Tackle"), ("shoot", "Shoot"), ("lofted", "Lofted"),
+    EFFECT_LABELS = [("shoot", "Shoot"), ("lofted", "Lofted"),
                      ("turn", "Turn"), ("face_movement", "Face move")]
     GIVEN_TO = [("OUTFIELD_ACTIONS", "Outfield"), ("KEEPER_ACTIONS", "Keepers"),
                 ("DEFAULT_ACTIONS", "Everyone")]
@@ -789,7 +799,7 @@ class ActionsScreen(Screen):
             return any(w.handle(event) for w in self.widgets if isinstance(w, ui.TextBox))
         if super().handle(event):
             return True
-        if event.type == pygame.MOUSEWHEEL and self.LIST_RECT.collidepoint(pygame.mouse.get_pos()):
+        if event.type == pygame.MOUSEWHEEL and self.LIST_RECT.collidepoint(ui.mouse_pos()):
             total = len(config.ACTIONS) * (self.ITEM_HEIGHT + self.ITEM_GAP)
             self.scroll = max(0, min(self.scroll - event.y * 30, total - self.LIST_RECT.height))
             return True
@@ -877,14 +887,46 @@ class ActionsScreen(Screen):
 
 class GameScreen(Screen):
     leave_label = "Main menu"       # the pause menu's button for leaving the match
+    ranked_name = None              # the ranked opponent, for the replay
+    # The discreet developer button for adding a timestamp mid-match
+    MARK_RECT = pygame.Rect(8, 24, 92, 18)
 
     def __init__(self, app):
         super().__init__(app)
         self.restart()
 
     def restart(self):
-        self.game = Game(Board(config.BOARD_COLS, config.BOARD_ROWS))
+        self.game = replay_module.RecordingGame(Board(config.BOARD_COLS, config.BOARD_ROWS))
         self.ai = AIController()
+        self.new_recording()
+
+    def new_recording(self):
+        self.timestamps = []            # [(frame index, note)] added during the match
+        self.replay_path = None         # set once saved at full time
+        self.replay_record = None
+
+    def controllers(self):
+        return dict(self.ai.controllers or config.CONTROLLERS)
+
+    def add_timestamp(self, note):
+        """Note the current moment; written into the replay (now, if it's saved already)."""
+        index = len(self.game.frames) - 1
+        if self.replay_record is None:
+            self.timestamps.append((index, note))
+        else:
+            replay_module.add_timestamp(self.replay_record, index, note)
+            replay_module.write(self.replay_path, self.replay_record)
+
+    def save_replay(self):
+        record = replay_module.new_record(self.game, self.controllers(), self.ranked_name)
+        for index, note in self.timestamps:
+            replay_module.add_timestamp(record, index, note)
+        try:
+            self.replay_path = replay_module.save(record)
+            self.replay_record = record
+        except OSError as error:
+            print(f"Couldn't save the replay: {error}")
+            self.replay_record = record     # keep timestamps in memory at least
 
     def full_time(self):
         """(choices, extra lines of text) for the full-time box."""
@@ -912,6 +954,10 @@ class GameScreen(Screen):
         if event.type != pygame.MOUSEBUTTONDOWN or event.button != 1:
             return False
         game = self.game
+        if self.MARK_RECT.collidepoint(event.pos):
+            self.app.push(NoteScreen(self.app, "Timestamp at turn "
+                                     f"{game.turn_number}", "", self.add_timestamp, self))
+            return True
         if game.over:
             choices, lines = self.full_time()
             self.full_time_choice(full_time_button_at_pixel(event.pos, choices, len(lines)))
@@ -932,12 +978,18 @@ class GameScreen(Screen):
         if self.ai_turn():
             self.game.hover_action = None   # the computer's choice is on show
         self.ai.update(self.game)
+        if self.game.over and self.replay_record is None:
+            self.save_replay()
 
     def draw(self, screen):
         self.app.renderer.draw(self.game, self.ai_turn(), self.ai.highlight,
                                self.full_time() if self.game.over else None)
         if not self.game.over:
             ui.text(screen, "Esc: menu", (10, 6), size=15, colour=ui.FAINT_TEXT_COLOUR)
+        marks = len(self.timestamps) + (len(self.replay_record["timestamps"])
+                                        if self.replay_record else 0)
+        label = "+ timestamp" + (f" ({marks})" if marks else "")
+        ui.text(screen, label, self.MARK_RECT.topleft, size=14, colour=ui.FAINT_TEXT_COLOUR)
 
 
 class RankedGameScreen(GameScreen):
@@ -949,13 +1001,15 @@ class RankedGameScreen(GameScreen):
 
     def __init__(self, app, number):
         self.number = number
+        self.ranked_name = ranking_module.Ranking.team_name(number)
         self.outcome = None             # lines for the full-time box, once recorded
         super().__init__(app)
 
     def restart(self):
-        self.game = Game(Board(config.BOARD_COLS, config.BOARD_ROWS))
+        self.game = replay_module.RecordingGame(Board(config.BOARD_COLS, config.BOARD_ROWS))
         self.ai = AIController(controllers={config.HOME: "human", config.AWAY: "ai"})
         self.outcome = None
+        self.new_recording()
 
     def update(self):
         super().update()
@@ -978,6 +1032,550 @@ class RankedGameScreen(GameScreen):
             self.app.pop()
         elif choice == "quit":
             self.app.quit()
+
+
+# --- Replays ---
+
+class NoteScreen(Screen):
+    """A small box over the screen below for typing a line of text: Enter
+    saves (on_submit(text)), Esc cancels. Used for timestamps and titles."""
+
+    def __init__(self, app, heading, initial, on_submit, below):
+        super().__init__(app)
+        self.heading, self.below, self.on_submit = heading, below, on_submit
+        self.panel = pygame.Rect(0, 0, 560, 150)
+        self.panel.center = (WIDTH // 2, HEIGHT // 2)
+        self.box = ui.TextBox((self.panel.left + 20, self.panel.top + 56, self.panel.width - 40, 36),
+                              lambda: initial, self.submit)
+        self.box.editing, self.box.draft = True, initial
+
+    def submit(self, text):
+        self.app.pop()
+        if text.strip():
+            self.on_submit(text.strip())
+
+    def handle(self, event):
+        if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+            self.app.pop()
+            return True
+        if event.type == pygame.MOUSEBUTTONDOWN and not self.panel.collidepoint(event.pos):
+            self.app.pop()                  # clicking outside cancels
+            return True
+        if self.box.handle(event):
+            return True
+        if not self.box.editing:            # clicked on the panel, not the box: keep typing
+            self.box.editing = True
+        return True
+
+    def draw(self, screen):
+        self.below.draw(screen)
+        shade = pygame.Surface(config.SCREEN_SIZE, pygame.SRCALPHA)
+        shade.fill(config.FULL_TIME_SHADE)
+        screen.blit(shade, (0, 0))
+        pygame.draw.rect(screen, config.FULL_TIME_PANEL_COLOUR, self.panel,
+                         border_radius=config.BUTTON_RADIUS * 2)
+        ui.text(screen, self.heading, (self.panel.left + 20, self.panel.top + 18), bold=True)
+        self.box.draw(screen)
+        ui.text(screen, "Enter to save, Esc to cancel", (self.panel.left + 20, self.panel.bottom - 34),
+                size=15, colour=ui.FAINT_TEXT_COLOUR)
+
+
+class ScrollList:
+    """Scrolling for a list of fixed-height rows in rect: wheel, keys, and a
+    bar on the right you can drag."""
+
+    def __init__(self, rect, row_height, count):
+        self.rect = pygame.Rect(rect)
+        self.row_height = row_height
+        self.count = count                  # a function giving the number of rows
+        self.bar = pygame.Rect(self.rect.right - 12, self.rect.top, 12, self.rect.height)
+        self.scroll = 0
+        self.dragging = False
+
+    def max_scroll(self):
+        return max(0, self.count() * self.row_height - self.rect.height)
+
+    def scroll_to(self, pixels):
+        self.scroll = max(0, min(self.max_scroll(), int(pixels)))
+
+    def thumb(self):
+        total = self.count() * self.row_height
+        if total <= self.rect.height:
+            return None
+        height = max(30, self.bar.height * self.rect.height // total)
+        top = self.bar.top + (self.bar.height - height) * self.scroll // self.max_scroll()
+        return pygame.Rect(self.bar.left, top, self.bar.width, height)
+
+    def row_top(self, index):
+        return self.rect.top + index * self.row_height - self.scroll
+
+    def row_at(self, pos):
+        if not self.rect.collidepoint(pos) or pos[0] >= self.bar.left:
+            return None
+        index = (pos[1] - self.rect.top + self.scroll) // self.row_height
+        return index if 0 <= index < self.count() else None
+
+    def handle(self, event):
+        if event.type == pygame.MOUSEWHEEL:
+            self.scroll_to(self.scroll - event.y * self.row_height)
+            return True
+        if event.type == pygame.KEYDOWN:
+            page = self.rect.height - self.row_height
+            moves = {pygame.K_UP: -self.row_height, pygame.K_DOWN: self.row_height,
+                     pygame.K_PAGEUP: -page, pygame.K_PAGEDOWN: page}
+            if event.key in moves:
+                self.scroll_to(self.scroll + moves[event.key])
+                return True
+            return False
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1 and self.bar.collidepoint(event.pos):
+            self.dragging = True
+            self.drag(event.pos[1])
+            return True
+        if event.type == pygame.MOUSEBUTTONUP and event.button == 1 and self.dragging:
+            self.dragging = False
+            return True
+        if event.type == pygame.MOUSEMOTION and self.dragging:
+            self.drag(event.pos[1])
+            return True
+        return False
+
+    def drag(self, y):
+        thumb = self.thumb()
+        if thumb is not None:
+            share = (y - self.bar.top - thumb.height / 2) / max(1, self.bar.height - thumb.height)
+            self.scroll_to(share * self.max_scroll())
+
+    def draw_bar(self, screen):
+        pygame.draw.rect(screen, config.STRIPE_COLOUR, self.bar, border_radius=6)
+        thumb = self.thumb()
+        if thumb is not None:
+            pygame.draw.rect(screen, config.MID_GREY, thumb, border_radius=6)
+
+
+def fit(text, width, size=15, bold=False):
+    """text cut short with '...' to fit in width pixels."""
+    f = ui.font(size, bold)
+    if f.size(text)[0] <= width:
+        return text
+    while text and f.size(text + "...")[0] > width:
+        text = text[:-1]
+    return text + "..."
+
+
+class ReplayListScreen(Screen):
+    """Every saved match, newest first, with its timestamps at a glance."""
+
+    title = "Replays"
+    ROW_H = 72
+    BUTTONS = {"watch": pygame.Rect(560, 0, 70, 26), "rename": pygame.Rect(636, 0, 70, 26),
+               "delete": pygame.Rect(712, 0, 56, 26)}
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.only_marked = False
+        self.replays = []
+        self.armed = (None, 0.0)            # (path, until) for a delete waiting for its second click
+        self.list = ScrollList((20, 70, WIDTH - 40, HEIGHT - 70 - 70), self.ROW_H, lambda: len(self.shown()))
+        self.widgets = [
+            ui.Button(BACK_RECT, "Back", self.back),
+            ui.Button((160, HEIGHT - 56, 260, 40),
+                      lambda: "Only with timestamps: " + ("On" if self.only_marked else "Off"),
+                      self.toggle_filter, active=lambda: self.only_marked),
+        ]
+        self.reload()
+
+    def reload(self):
+        self.replays = replay_module.list_replays()
+        self.list.scroll_to(self.list.scroll)
+
+    def shown(self):
+        return [(p, r) for p, r in self.replays if r.get("timestamps") or not self.only_marked]
+
+    def toggle_filter(self):
+        self.only_marked = not self.only_marked
+        self.list.scroll_to(0)
+
+    def button_at(self, pos):
+        index = self.list.row_at(pos)
+        if index is None:
+            return None, None
+        y = self.list.row_top(index) + 6
+        for name, rect in self.BUTTONS.items():
+            if rect.move(0, y).collidepoint(pos):
+                return index, name
+        return index, None
+
+    def handle(self, event):
+        if super().handle(event) or self.list.handle(event):
+            return True
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            index, name = self.button_at(event.pos)
+            if index is None:
+                return False
+            path, record = self.shown()[index]
+            if name == "watch":
+                self.app.push(ReplayScreen(self.app, path, record))
+            elif name == "rename":
+                def rename(title):
+                    record["title"] = title
+                    replay_module.write(path, record)
+                self.app.push(NoteScreen(self.app, "Title for this replay", record.get("title", ""),
+                                         rename, self))
+            elif name == "delete":
+                if self.armed[0] == path and time.perf_counter() < self.armed[1]:
+                    replay_module.delete(path)
+                    self.armed = (None, 0.0)
+                    self.reload()
+                else:
+                    self.armed = (path, time.perf_counter() + 3.0)
+            return True
+        return False
+
+    def draw(self, screen):
+        super().draw(screen)
+        rows = self.shown()
+        if not rows:
+            message = ("No replays with timestamps yet." if self.only_marked and self.replays
+                       else "No replays yet: matches are saved here at full time.")
+            ui.text(screen, message, (WIDTH // 2, 200), anchor="midtop", colour=ui.FAINT_TEXT_COLOUR)
+        screen.set_clip(self.list.rect)
+        text_width = self.BUTTONS["watch"].left - 40
+        for index, (path, record) in enumerate(rows):
+            top = self.list.row_top(index)
+            if top + self.ROW_H < self.list.rect.top or top > self.list.rect.bottom:
+                continue
+            band = pygame.Rect(self.list.rect.left, top, self.list.bar.left - self.list.rect.left - 4,
+                               self.ROW_H - 4)
+            pygame.draw.rect(screen, config.STRIPE_COLOUR, band, border_radius=6)
+            x = band.left + 10
+            ui.text(screen, fit(replay_module.headline(record), text_width, 16, True), (x, top + 6),
+                    size=16, bold=True)
+            turns = record["frames"][-1]["state"]["turn"]
+            when = record.get("saved", "").replace("T", " ")[:16]
+            detail = f"{replay_module.who_played(record)}  -  {turns} turns"
+            if record.get("title"):
+                detail += f"  -  {when}"
+            ui.text(screen, fit(detail, text_width, 14), (x, top + 28),
+                    size=14, colour=ui.FAINT_TEXT_COLOUR)
+            marks = record.get("timestamps") or []
+            notes = "   ".join(f"T{m['turn']}: {m['note']}" for m in marks) or "No timestamps"
+            ui.text(screen, fit(notes, band.width - 20, 14), (x, top + 48), size=14,
+                    colour=config.TEXT_COLOUR if marks else ui.FAINT_TEXT_COLOUR)
+            armed = self.armed[0] == path and time.perf_counter() < self.armed[1]
+            for name, rect in self.BUTTONS.items():
+                label = {"watch": "Watch", "rename": "Rename", "delete": "Sure?" if armed else "Delete"}[name]
+                ui.draw_box(screen, rect.move(0, top + 6), label, *ui.colours(active=armed and name == "delete"),
+                            size=14)
+        screen.set_clip(None)
+        self.list.draw_bar(screen)
+
+
+class Slider:
+    """A horizontal slider for a value between low and high (on a log scale
+    if log): click or drag."""
+
+    def __init__(self, rect, label, get, set, low, high, log=False, show=str):
+        self.rect = pygame.Rect(rect)
+        self.label, self.get, self.set = label, get, set
+        self.low, self.high, self.log, self.show = low, high, log, show
+        self.dragging = False
+
+    def _share(self, value):
+        if self.log:
+            return math.log(value / self.low) / math.log(self.high / self.low)
+        return (value - self.low) / (self.high - self.low)
+
+    def _value(self, share):
+        share = max(0.0, min(1.0, share))
+        if self.log:
+            return self.low * (self.high / self.low) ** share
+        return self.low + (self.high - self.low) * share
+
+    def track(self):
+        return pygame.Rect(self.rect.left + 70, self.rect.centery - 3, self.rect.width - 140, 6)
+
+    def handle(self, event):
+        track = self.track()
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1 and \
+                self.rect.collidepoint(event.pos):
+            self.dragging = True
+        elif event.type == pygame.MOUSEBUTTONUP and event.button == 1 and self.dragging:
+            self.dragging = False
+            return True
+        elif not (event.type == pygame.MOUSEMOTION and self.dragging):
+            return False
+        self.set(self._value((event.pos[0] - track.left) / max(1, track.width)))
+        return True
+
+    def draw(self, screen):
+        track = self.track()
+        ui.text(screen, self.label, (self.rect.left, self.rect.centery), size=15, anchor="midleft")
+        pygame.draw.rect(screen, config.STRIPE_COLOUR, track, border_radius=3)
+        x = track.left + track.width * self._share(self.get())
+        pygame.draw.circle(screen, config.BUTTON_COLOUR, (int(x), track.centery), 9)
+        ui.text(screen, self.show(self.get()), (self.rect.right, self.rect.centery), size=15,
+                anchor="midright")
+
+
+class ReplayScreen(Screen):
+    """Rewatch a saved match: step through it a move or a turn at a time,
+    play it at any speed, jump to a timestamp, and add or edit timestamps.
+    Keys: Space play/pause, Left/Right a move, Up/Down a turn, Home/End."""
+
+    SEEK = pygame.Rect(20, 486, WIDTH - 40, 14)
+
+    def __init__(self, app, path, record):
+        super().__init__(app)
+        self.path, self.record = path, record
+        self.frames = record["frames"]
+        self.index = 0
+        self.playing = False
+        self.speed = 1.0                    # moves per second
+        self.next_at = 0.0
+        self.seeking = False
+        y1, y2, h = 530, 566, 28
+        bw = 54
+
+        def at(i):
+            return (20 + i * (bw + 6), y1, bw, h)
+
+        self.widgets = [
+            ui.Button(at(0), "|<", lambda: self.go(0)),
+            ui.Button(at(1), "<< turn", self.turn_back),
+            ui.Button(at(2), "< move", lambda: self.go(self.index - 1)),
+            ui.Button((20 + 3 * (bw + 6), y1, 76, h), lambda: "Pause" if self.playing else "Play",
+                      self.toggle_play, active=lambda: self.playing),
+            ui.Button((20 + 3 * (bw + 6) + 82, y1, bw, h), "move >", lambda: self.go(self.index + 1)),
+            ui.Button((20 + 4 * (bw + 6) + 82, y1, bw, h), "turn >>", self.turn_forward),
+            ui.Button((20 + 5 * (bw + 6) + 82, y1, bw, h), ">|", lambda: self.go(len(self.frames) - 1)),
+            Slider((470, y1, 310, h), "Speed", lambda: self.speed, self.set_speed, 0.25, 16, log=True,
+                   show=lambda v: f"{v:.2g} moves/s"),
+            ui.Button((20, y2, 100, h), "Back", self.back),
+            ui.Button((130, y2, 110, h), "Settings", lambda: app.push(ReplaySettingsScreen(app, record))),
+            ui.Button((250, y2, 170, h), lambda: f"Timestamps ({len(record['timestamps'])})",
+                      lambda: app.push(TimestampsScreen(app, self)),
+                      enabled=lambda: bool(record["timestamps"])),
+            ui.Button((430, y2, 190, h), "+ Timestamp here", self.mark),
+        ]
+
+    # Moving around
+
+    def go(self, index):
+        self.index = max(0, min(len(self.frames) - 1, index))
+        if self.index == len(self.frames) - 1:
+            self.playing = False
+
+    def turn_starts(self):
+        return replay_module.turn_starts(self.record)
+
+    def turn_back(self):
+        starts = [s for s in self.turn_starts() if s < self.index]
+        self.go(starts[-1] if starts else 0)
+
+    def turn_forward(self):
+        later = [s for s in self.turn_starts() if s > self.index]
+        self.go(later[0] if later else len(self.frames) - 1)
+
+    def toggle_play(self):
+        if self.index >= len(self.frames) - 1:
+            self.index = 0                  # play again from the start
+        self.playing = not self.playing
+        self.next_at = time.perf_counter() + 1 / self.speed
+
+    def set_speed(self, value):
+        self.speed = value
+        self.next_at = min(self.next_at, time.perf_counter() + 1 / value)
+
+    def seek_to(self, x):
+        share = (x - self.SEEK.left) / max(1, self.SEEK.width)
+        self.go(round(share * (len(self.frames) - 1)))
+
+    # Timestamps
+
+    def save(self):
+        try:
+            replay_module.write(self.path, self.record)
+        except OSError as error:
+            print(f"Couldn't save the replay: {error}")
+
+    def mark(self):
+        def add(note):
+            replay_module.add_timestamp(self.record, self.index, note)
+            self.save()
+        self.playing = False
+        self.app.push(NoteScreen(self.app, f"Timestamp at turn {replay_module.frame_turn(self.record, self.index)}",
+                                 "", add, self))
+
+    # Input and drawing
+
+    def handle(self, event):
+        if event.type == pygame.KEYDOWN:
+            keys = {pygame.K_SPACE: self.toggle_play,
+                    pygame.K_RIGHT: lambda: self.go(self.index + 1),
+                    pygame.K_LEFT: lambda: self.go(self.index - 1),
+                    pygame.K_UP: self.turn_forward, pygame.K_DOWN: self.turn_back,
+                    pygame.K_HOME: lambda: self.go(0),
+                    pygame.K_END: lambda: self.go(len(self.frames) - 1)}
+            if event.key in keys:
+                keys[event.key]()
+                return True
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1 and \
+                self.SEEK.inflate(0, 10).collidepoint(event.pos):
+            self.seeking = True
+            self.seek_to(event.pos[0])
+            return True
+        if event.type == pygame.MOUSEMOTION and self.seeking:
+            self.seek_to(event.pos[0])
+            return True
+        if event.type == pygame.MOUSEBUTTONUP and self.seeking:
+            self.seeking = False
+            return True
+        return super().handle(event)
+
+    def update(self):
+        if self.playing and time.perf_counter() >= self.next_at:
+            self.go(self.index + 1)
+            self.next_at = time.perf_counter() + 1 / self.speed
+
+    def draw(self, screen):
+        screen.fill(config.BACKGROUND_COLOUR)
+        renderer = self.app.renderer
+        frame = self.frames[self.index]
+        move = frame["move"] or {}
+        start = tuple(move["from"]) if move.get("from") else None
+        end = tuple(move["to"]) if move.get("to") else None
+        with replay_module.pitch_settings(self.record):
+            game = replay_module.frame_game(self.record, self.index)
+            for tile in game.board:
+                border = None
+                if tile.coord == end:
+                    border = (config.SELECTED_COLOUR, config.SELECTED_BORDER_WIDTH)
+                elif tile.coord == start:
+                    border = (config.STEP_TARGET_COLOUR, config.STEP_TARGET_WIDTH)
+                renderer.draw_tile(tile, border, game.board)
+            renderer.draw_ball(game.board.ball)
+            renderer.draw_score(game)
+        ui.text(screen, fit("Replay - " + replay_module.who_played(self.record), 300, 14), (10, 6),
+                size=14, colour=ui.FAINT_TEXT_COLOUR)
+
+        # Seek bar with the timestamps marked on it
+        pygame.draw.rect(screen, config.STRIPE_COLOUR, self.SEEK, border_radius=7)
+        last = max(1, len(self.frames) - 1)
+        filled = self.SEEK.copy()
+        filled.width = max(14, int(self.SEEK.width * self.index / last))
+        pygame.draw.rect(screen, config.BUTTON_COLOUR, filled, border_radius=7)
+        for mark in self.record["timestamps"]:
+            x = self.SEEK.left + self.SEEK.width * mark["frame"] / last
+            pygame.draw.rect(screen, config.SELECTED_COLOUR, (int(x) - 2, self.SEEK.top - 4, 4,
+                                                                self.SEEK.height + 8))
+
+        # Where we are and what happened
+        starts = self.turn_starts()
+        start_of_turn = max(s for s in starts if s <= self.index)
+        end_of_turn = min([s for s in starts if s > self.index] + [len(self.frames)])
+        moves_in_turn = end_of_turn - start_of_turn - 1
+        move_number = self.index - start_of_turn
+        turn = replay_module.frame_turn(self.record, self.index)
+        where = (f"Turn {turn}, move {move_number} of {moves_in_turn}" if move_number
+                 else f"Turn {turn}, start")
+        notes = [m["note"] for m in self.record["timestamps"] if m["frame"] == self.index]
+        line = f"{where}  -  {replay_module.describe_move(self.record, self.index)}"
+        if notes:
+            line += "   [" + " | ".join(notes) + "]"
+        ui.text(screen, fit(line, WIDTH - 40, 15), (20, 506), size=15)
+        for widget in self.widgets:
+            widget.draw(screen)
+
+
+class TimestampsScreen(Screen):
+    """A replay's timestamps: jump to one, edit its note or delete it."""
+
+    title = "Timestamps"
+    ROW_H = 40
+    BUTTONS = {"jump": pygame.Rect(540, 0, 70, 28), "edit": pygame.Rect(616, 0, 70, 28),
+               "delete": pygame.Rect(692, 0, 70, 28)}
+
+    def __init__(self, app, viewer):
+        super().__init__(app)
+        self.viewer = viewer
+        self.marks = viewer.record["timestamps"]
+        self.list = ScrollList((20, 70, WIDTH - 40, HEIGHT - 140), self.ROW_H, lambda: len(self.marks))
+        self.widgets = [ui.Button(BACK_RECT, "Back", self.back)]
+
+    def handle(self, event):
+        if super().handle(event) or self.list.handle(event):
+            return True
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            index = self.list.row_at(event.pos)
+            if index is None:
+                return False
+            y = self.list.row_top(index) + 6
+            mark = self.marks[index]
+            if self.BUTTONS["jump"].move(0, y).collidepoint(event.pos):
+                self.viewer.playing = False
+                self.viewer.go(mark["frame"])
+                self.app.pop()
+            elif self.BUTTONS["edit"].move(0, y).collidepoint(event.pos):
+                def edit(note):
+                    mark["note"] = note
+                    self.viewer.save()
+                self.app.push(NoteScreen(self.app, f"Timestamp at turn {mark['turn']}", mark["note"],
+                                         edit, self))
+            elif self.BUTTONS["delete"].move(0, y).collidepoint(event.pos):
+                self.marks.remove(mark)
+                self.viewer.save()
+                if not self.marks:
+                    self.app.pop()
+            return True
+        return False
+
+    def draw(self, screen):
+        super().draw(screen)
+        screen.set_clip(self.list.rect)
+        for index, mark in enumerate(self.marks):
+            top = self.list.row_top(index)
+            band = pygame.Rect(self.list.rect.left, top, self.list.bar.left - self.list.rect.left - 4,
+                               self.ROW_H - 4)
+            pygame.draw.rect(screen, config.STRIPE_COLOUR, band, border_radius=6)
+            ui.text(screen, fit(f"Turn {mark['turn']}:  {mark['note']}", self.BUTTONS["jump"].left - 50),
+                    (band.left + 10, band.centery), size=15, anchor="midleft")
+            for name, rect in self.BUTTONS.items():
+                ui.draw_box(screen, rect.move(0, top + 6), name.capitalize(), *ui.colours(), size=14)
+        screen.set_clip(None)
+        self.list.draw_bar(screen)
+
+
+class ReplaySettingsScreen(Screen):
+    """Who played a replay, and the settings it was played with."""
+
+    title = "Replay settings"
+    LINE_H = 18
+
+    def __init__(self, app, record):
+        super().__init__(app)
+        lines = [replay_module.who_played(record),
+                 f"Saved {record.get('saved', '').replace('T', ' ')}", ""]
+        for name, text in record.get("settings", {}).items():
+            first, *rest = text.splitlines() or [""]
+            lines.append(f"{name} = {first}")
+            lines.extend("    " + line for line in rest)
+        self.lines = lines
+        self.list = ScrollList((20, 70, WIDTH - 40, HEIGHT - 140), self.LINE_H, lambda: len(self.lines))
+        self.widgets = [ui.Button(BACK_RECT, "Back", self.back)]
+
+    def handle(self, event):
+        return super().handle(event) or self.list.handle(event)
+
+    def draw(self, screen):
+        super().draw(screen)
+        screen.set_clip(self.list.rect)
+        for index, line in enumerate(self.lines):
+            top = self.list.row_top(index)
+            if self.list.rect.top - self.LINE_H <= top <= self.list.rect.bottom:
+                ui.text(screen, fit(line, self.list.bar.left - self.list.rect.left - 10, 14),
+                        (self.list.rect.left + 4, top), size=14)
+        screen.set_clip(None)
+        self.list.draw_bar(screen)
 
 
 # --- Rankings ---
@@ -1009,8 +1607,6 @@ class RankingsScreen(Screen):
     COLUMNS = {"place": 40, "name": 110, "rating": 330}
     VIEW_RECT = pygame.Rect(470, 0, 110, 28)       # x and size; y set per row
     CHALLENGE_RECT = pygame.Rect(592, 0, 140, 28)
-    YOU_COLOUR = (255, 236, 160)
-    STRIPE_COLOUR = (228, 228, 228)
 
     def __init__(self, app):
         super().__init__(app)
@@ -1139,9 +1735,9 @@ class RankingsScreen(Screen):
                 continue
             band = pygame.Rect(self.table.left, top, self.bar.left - self.table.left - 4, self.ROW_H)
             if number is None:
-                pygame.draw.rect(screen, self.YOU_COLOUR, band)
+                pygame.draw.rect(screen, config.HIGHLIGHT_ROW_COLOUR, band)
             elif index % 2:
-                pygame.draw.rect(screen, self.STRIPE_COLOUR, band)
+                pygame.draw.rect(screen, config.STRIPE_COLOUR, band)
             middle = top + self.ROW_H // 2
             you = number is None
             ui.text(screen, f"#{place}", (self.COLUMNS["place"], middle), anchor="midleft", bold=you)
@@ -1153,7 +1749,7 @@ class RankingsScreen(Screen):
                 ui.draw_box(screen, self.CHALLENGE_RECT.move(0, y), "Challenge",
                             *ui.colours(self.can_challenge(number)), size=15)
         screen.set_clip(None)
-        pygame.draw.rect(screen, self.STRIPE_COLOUR, self.bar, border_radius=6)
+        pygame.draw.rect(screen, config.STRIPE_COLOUR, self.bar, border_radius=6)
         thumb = self.thumb()
         if thumb is not None:
             pygame.draw.rect(screen, config.MID_GREY, thumb, border_radius=6)
@@ -1366,6 +1962,24 @@ class RankingSettingsScreen(Screen):
                    colour=ui.FAINT_TEXT_COLOUR)
 
 
+def dark_mode_button(rect):
+    """Switches dark mode on and off (kept by Save to config.py)."""
+    def flip():
+        theme.toggle()
+        settings.changed()
+    return ui.Button(rect, lambda: "Dark mode: " + ("On" if config.DARK_MODE else "Off"), flip,
+                     active=lambda: config.DARK_MODE)
+
+
+def fullscreen_button(app, rect):
+    """Switches fullscreen on and off (also F11; kept by Save to config.py)."""
+    def flip():
+        app.toggle_fullscreen()
+        settings.changed()
+    return ui.Button(rect, lambda: "Fullscreen: " + ("On" if config.FULLSCREEN else "Off"), flip,
+                     active=lambda: config.FULLSCREEN)
+
+
 class PauseScreen(Screen):
     """Over the match: Resume / Restart match / Main menu / Quit. The match
     (and the computer players) stop while it's open."""
@@ -1384,9 +1998,11 @@ class PauseScreen(Screen):
             ui.Button(row(0), "Resume", self.back),
             ui.Button(row(1), "Restart match", self.restart),
             ui.Button(row(2), game_screen.leave_label, self.main_menu),
-            ui.Button(row(3), "Quit", app.quit),
+            dark_mode_button(row(3)),
+            fullscreen_button(app, row(4)),
+            ui.Button(row(5), "Quit", app.quit),
         ]
-        self.panel = pygame.Rect(0, 0, w + 60, 4 * (h + gap) + 80)
+        self.panel = pygame.Rect(0, 0, w + 60, 6 * (h + gap) + 80)
         self.panel.midtop = (WIDTH // 2, top - 60)
 
     def restart(self):

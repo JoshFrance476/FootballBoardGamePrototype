@@ -13,19 +13,23 @@ A turn:
     which any of its players can use.
   - The first time each player gets the ball in a turn, the team earns an
     extra actions, which any of its players can use: holding it at the start
-    of the turn earns config.START_POSSESSION_ACTIONS, winning it with a
-    tackle config.TACKLE_POSSESSION_ACTIONS, and any other way (receiving a
+    of the turn earns config.START_POSSESSION_ACTIONS, winning it by moving
+    across the carrier config.TACKLE_POSSESSION_ACTIONS, and any other way (receiving a
     pass, picking up a loose ball) config.RECEIVE_POSSESSION_ACTIONS. Getting it back later in the same turn earns nothing more.
   - Steps and actions can happen in any order. Press End turn when done.
+  - Tackling: a player who moves (free step or action) from a tile next to
+    the opponent with the ball to another tile next to them tackles, with
+    config.TACKLE_CHANCE for the side they start on. Won or not, they end up
+    where they were going; with the ball if it won.
+  - Going past: a player with the ball who moves from a tile next to an
+    opponent to another tile next to that opponent gives them a tackle. If it
+    wins the ball goes to that opponent and the carrier still makes the move.
+    Moving straight away from an opponent is safe.
   - Shielding: an action with "shield" takes that much off the chance of
-    any tackle on the player (normal or zone of control) until their team's
-    next turn starts, or until they move.
-  - Zone of control: when a player with the ball steps (or carries it with an
-    action) to another tile, each opponent next to them gets a free tackle
-    first (config.ZOC_TACKLE_CHANCE). If one wins, the player stays where they
-    were (the step is still used) and the ball goes to that opponent. Passes
-    can be intercepted by opponents next to their path (config.INTERCEPT_CHANCE);
-    see actions.py.
+    being tackled by an opponent moving across the player, until their
+    team's next turn starts, or until they move.
+  - Passes can be intercepted by opponents next to their path
+    (config.INTERCEPT_CHANCE). See actions.py for the details.
 After a goal, everyone goes back to kick-off positions and the team that
 conceded takes the next turn. Turns always alternate, so a match of
 config.TURNS_PER_TEAM turns each is over after twice that many turns.
@@ -34,7 +38,8 @@ import random
 from typing import NamedTuple, Optional
 
 import config
-from actions import apply_outcome, outcomes, percent, preview_outcomes, zoc_tackles
+from actions import (apply_outcome, carry_tackles, moving_tackle, outcomes, percent,
+                     preview_outcomes)
 from hex_math import facing_after_move, neighbours
 
 
@@ -235,23 +240,37 @@ class Game:
     def _step(self, move):
         tile, destination = self.board.get(move.coord), self.board.get(move.target)
         carrying = self.board.ball == tile.coord
-        risks = zoc_tackles(self.board, tile) if carrying else ()
-        # Zone of control: each opponent next to the carrier tackles first
-        for coord, chance in risks:
-            if self.roll() < chance:
-                self.board.ball = coord
-                self.stepped.add(tile.coord)    # the step is used up
-                self.message = f"Tackled stepping away ({percent(chance)})"
-                return tile
+        self.message = ""
+        if carrying:
+            # Going past opponents: each gets a tackle, in order
+            risks = carry_tackles(self.board, tile, destination.coord)
+            for coord, chance in risks:
+                if self.roll() < chance:
+                    self.board.ball = coord
+                    carrying = False            # the step still happens, without the ball
+                    self.message = f"Tackled going past ({percent(chance)})"
+                    break
+            else:
+                if risks:
+                    self.message = "Got past the tackle" + ("s" if len(risks) > 1 else "")
+            tackle_won = False
+        else:
+            # Stepping across the opponent with the ball tackles them
+            tackle = moving_tackle(self.board, tile, destination.coord)
+            tackle_won = tackle is not None and self.roll() < tackle[1]
+            if tackle is not None:
+                self.message = f"Tackle {'won' if tackle_won else 'failed'} ({percent(tackle[1])})"
         facing = facing_after_move(tile.coord, destination.coord, tile.player.facing)
         self.board.move_player(tile, destination)
-        if carrying:
+        if carrying or tackle_won:
             self.board.ball = destination.coord
         destination.player.facing = facing
         destination.player.shield = 0.0         # moving ends a shield
         self._player_moved(tile.coord, destination.coord)
         self.stepped.add(destination.coord)
-        self.message = ("Got away from the tackle" + ("s" if len(risks) > 1 else "")) if risks else ""
+        if tackle_won and destination.coord not in self.had_ball:
+            self.had_ball.add(destination.coord)
+            self.actions_remaining += config.TACKLE_POSSESSION_ACTIONS
         return destination
 
     def _act(self, move):
@@ -397,15 +416,34 @@ class Game:
         elif self.viewing_opponent:
             return (f"Viewing a {config.TEAM_NAMES[self.selected.player.team]} player: "
                     f"hover over an action to see where it goes")
-        elif self.selected is not None and self.board.ball == self.selected.coord \
-                and self.selected_step_targets:
-            keep = 1.0
-            for _, chance in zoc_tackles(self.board, self.selected):
-                keep *= 1 - chance
-            if keep < 1:
-                risk = f"Stepping away: {percent(1 - keep)} chance of being tackled"
+        elif self.selected is not None and self.selected_step_targets:
+            risk = self.step_tackle_note()
+            if risk:
                 return f"{self.message} - {risk}" if self.message else risk
         return self.message
+
+    def step_tackle_note(self):
+        """What stepping the selected player could do with tackles: the risk
+        of going past opponents with the ball, or the chance of tackling by
+        stepping across the carrier. "" if none of their steps involve one."""
+        tile = self.selected
+        if self.board.ball == tile.coord:
+            losses = []
+            for target in self.selected_step_targets:
+                keep = 1.0
+                for _, chance in carry_tackles(self.board, tile, target):
+                    keep *= 1 - chance
+                if keep < 1:
+                    losses.append(1 - keep)
+            if losses:
+                worst = max(losses)
+                return f"Stepping past an opponent: up to {percent(worst)} chance of being tackled"
+            return ""
+        chances = sorted({t[1] for t in (moving_tackle(self.board, tile, target)
+                                         for target in self.selected_step_targets) if t})
+        if chances:
+            return "Stepping across the ball carrier tackles: " + " / ".join(map(percent, chances))
+        return ""
 
     # --- Human input ---
 

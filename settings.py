@@ -16,6 +16,7 @@ from collections import deque
 import actions as actions_module
 import ai
 import config
+import theme
 from board import shift_top
 from hex_math import hex_distance, neighbours, rectangle_coords, row_is_short, row_start
 
@@ -26,16 +27,17 @@ EDITABLE = [
     "TURNS_PER_TEAM", "CONTROLLERS", "ACTIONS_PER_TURN", "AI_ENGINE", "AI_PLAN_SECONDS", "AI_THINK_SECONDS",
     "AI_MOVE_DELAY", "BOARD_COLS", "BOARD_ROWS", "KEEPER_BOX_RADIUS", "TACKLE_CHANCE",
     "START_POSSESSION_ACTIONS", "TACKLE_POSSESSION_ACTIONS", "RECEIVE_POSSESSION_ACTIONS",
-    "ZOC_TACKLE_CHANCE", "INTERCEPT_CHANCE", "MAX_PLAYER_ACTIONS",
+    "TACKLE_MOVE_CHECK", "INTERCEPT_CHANCE", "MAX_PLAYER_ACTIONS",
     "SHIFTED_ROWS",
     "KEEPER_SAVE_CHANCE", "SHOT_CHANCE", "ACTIONS", "DEFAULT_ACTIONS", "OUTFIELD_ACTIONS",
     "KEEPER_ACTIONS", "INITIAL_SETUP", "INITIAL_BALL",
+    "DARK_MODE", "FULLSCREEN",
     "RANKING_TEAMS", "RANKING_TOP_RATING", "RANKING_POINTS_PER_PLACE", "RANKING_WIN_SHARE",
     "RANKING_MIN_WIN", "RANKING_DRAW_SHARE", "RANKING_LOSS_MAX", "RANKING_LOSS_HALF_GAP",
 ]
 
 # Keys of an action, in the order they're written out
-ACTION_KEY_ORDER = ["requires", "tackle", "self", "ball", "lofted", "turn", "face_movement",
+ACTION_KEY_ORDER = ["requires", "self", "ball", "lofted", "turn", "face_movement",
                     "shoot", "shield"]
 
 _saved = {}   # EDITABLE values as they are in config.py
@@ -62,6 +64,7 @@ def revert():
     """Throw away every edit: reload config.py."""
     importlib.reload(config)
     actions_module.apply_config_defaults()
+    theme.apply(fresh=True)
     _remember_saved()
     changed()
 
@@ -500,7 +503,7 @@ def format_setting(name, old_lines):
         return format_actions(old_lines)
     if name == "INITIAL_SETUP":
         return format_setup(old_lines)
-    if name in ("TACKLE_CHANCE", "SHOT_CHANCE", "KEEPER_SAVE_CHANCE", "ZOC_TACKLE_CHANCE"):
+    if name in ("TACKLE_CHANCE", "SHOT_CHANCE", "KEEPER_SAVE_CHANCE"):
         return format_chance_table(name, value, old_lines)
     if name in ("CONTROLLERS", "ACTIONS_PER_TURN"):
         return f"{name} = {{" + ", ".join(f"{team_key(t)}: {lit(c)}"

@@ -27,7 +27,7 @@ import config
 from actions import (AI_WEIGHT_DEFAULTS, LOSE, WIN, WITH_PLAYER, dice_branches,
                      interceptions, keeper_save_chance, meets_requirements, offset_list,
                      outcomes, path_blocked, scoring_chance, shot_chance, shielded,
-                     tackle_chance, zoc_tackles)
+                     carry_tackles, moving_tackle, tackle_chance, tackle_side)
 from game import END_TURN, STEP, Move, other_team
 from hex_math import hex_distance, is_in_front, neighbours, offset_for_facing
 
@@ -46,34 +46,37 @@ def evaluate(game, team, start_score):
       loose_ball    when nobody has the ball: up to +/- this, by how much
                     nearer team's closest player is than the opponent's
       progress      for whichever team has the ball: from 0 with the ball on
-                    their own goal up to this with it on the goal they attack
-                    (+ for team, - for the opponent). A loose ball counts for
-                    nobody, so kicking it away upfield gains nothing. Curved
-                    by config.AI_PROGRESS_CURVE: above 1, holding the ball in
-                    midfield is worth little and the final third a lot.
+                    their own goal, growing up the pitch until it's
+                    config.AI_PROGRESS_STOP tiles from the goal they attack
+                    (+ for team, - for the opponent). Closer than that it
+                    stops growing: in shooting range the ball is only worth
+                    the shot it sets up, so holding it near goal (or by the
+                    corner flag) never beats shooting. A loose ball counts
+                    for nobody, so kicking it away upfield gains nothing.
+                    Curved by config.AI_PROGRESS_CURVE: above 1, holding the
+                    ball in midfield is worth little and the final third a lot.
       shot_chance   the chance a shot from where the ball is goes in (after the
                     keeper's save chance), for whichever
                     team has it (+ for team, - for the opponent)
-      ball_safety   minus the best tackle chance the opponents can set up on
-                    their next turn: an opponent already next to the carrier,
-                    or one who can take their free step next to them, using
-                    TACKLE_CHANCE for the side they'd tackle from. Only
-                    counted when the opponents move next.
+      ball_safety   minus the chance the opponents win the ball on their next
+                    turn by moving across the carrier, counting every tackle
+                    they can try (see tackle_attempts). Only counted when the
+                    opponents move next.
       shot_threat   the best shot chance the carrier's team can set up on its
                     next turn (free step plus carrying the ball with an
                     action, then shooting), times the chance of getting away
-                    from the zone of control tackles if the carrier has to
-                    move. Only counted when that team moves next.
+                    without being tackled if the carrier has to move (see
+                    escape_keep). Only counted when that team moves next.
       support       for the team with the ball: how well the carrier can pass
                     to each teammate (see passing_options): 1 for a safe ball
                     to an unmarked teammate, less for interception risk or a
                     marked receiver, averaged over the teammates. So
                     defenders also gain by standing next to passing lanes.
-      trapped       for the team with the ball: minus the chance of losing it
-                    to zone of control tackles if the carrier has to move
-                    away from the opponents next to them, reduced by how good
-                    their best pass out is. So defenders gain by boxing the
-                    carrier in, and carriers avoid ending up next to opponents.
+      trapped       for the team with the ball: minus the chance of being
+                    tackled on the carrier's safest step (stepping past
+                    opponents next to them; straight away is safe), reduced
+                    by how good their best pass out is. So defenders gain by
+                    boxing the carrier in from more than one side.
       cover         for a team defending against a ball carrier: the fraction
                     of its players between the ball and their own goal
       pressing      for a team defending against a ball carrier: 1 if one of
@@ -89,12 +92,15 @@ def evaluate(game, team, start_score):
     # If the opponents move next and can tackle the carrier, the position is
     # worth a mix of keeping the ball and losing it, by the tackle chance.
     # (A fixed penalty undervalued this badly with certain front tackles.)
+    # Every defender who can try counts (see tackle_attempts); if it's lost,
+    # the best tackler is assumed to have it.
     carrier_tile = game.board.get(game.board.ball)
     carrier = carrier_tile.player
-    if (carrier is not None and game.active_team != carrier.team
-            and config.ACTIONS_PER_TURN.get(game.active_team, 1) > 0):
-        chance, tackle_at, tackler_at = best_tackle(game.board, carrier_tile)
-        if chance > 0:
+    if carrier is not None and game.active_team != carrier.team:
+        attempts = tackle_attempts(game.board, carrier_tile, game.stepped, game.actions_remaining)
+        if attempts:
+            chance = combined_chance(attempts)
+            _, tackle_at, tackler_at = attempts[0]
             lost = value_if_tackled(game, team, start_score, tackle_at, tackler_at)
             value = (1 - chance) * value + chance * lost
     return value
@@ -106,28 +112,34 @@ def weight(name):
     return AI_WEIGHT_DEFAULTS.get(name, 0.0) if value is None else value
 
 
-# Terms that reward team's own attack; chase_boost scales these while team has the ball
+# Terms that reward team's own attack; chase_boost scales these while team has
+# the ball, and goals team scores whoever has the ball afterwards
 ATTACK_TERMS = ("progress", "shot_chance", "shot_threat", "runs")
 
 
 def weighted_terms(game, team, start_score):
     terms = evaluation_terms(game, team, start_score)
-    boost = chase_boost(game, team) if terms.get("possession", 0) > 0 else 0.0
+    boost = chase_boost(game, team, start_score)
+    attacking = terms.get("possession", 0) > 0
     total = 0.0
     for name, amount in terms.items():
         if amount:
-            scale = 1 + boost if boost and name in ATTACK_TERMS else 1
-            total += weight(name) * scale * amount
+            boosted = boost and ((name == "goal" and amount > 0)
+                                 or (attacking and name in ATTACK_TERMS))
+            total += weight(name) * (1 + boost if boosted else 1) * amount
     return total
 
 
-def chase_boost(game, team):
-    """How much extra weight team's attacking terms get while it has the ball:
-    config.AI_CHASE_BOOST for whether team is "behind", "level" or "ahead"
-    on the current score. With a turn limit, half of it at kick-off rising to
-    all of it at full time, so a losing team gets more desperate as time runs
-    out. 0.5 means the attacking terms count 50% more."""
-    mine, theirs = game.score[team], game.score[other_team(team)]
+def chase_boost(game, team, start_score=None):
+    """How much extra weight team's attacking terms (and goals it scores) get:
+    config.AI_CHASE_BOOST for whether team was "behind", "level" or "ahead"
+    when the search started (start_score; the current score if None). With
+    a turn limit, half of it at kick-off rising to all of it at full time,
+    so a losing team gets more desperate as time runs out. 0.5 means those
+    terms count 50% more. Goals get the boost too, so a shot always gains
+    on holding the ball."""
+    score = game.score if start_score is None else start_score
+    mine, theirs = score[team], score[other_team(team)]
     state = "behind" if mine < theirs else "ahead" if mine > theirs else "level"
     boost = config.AI_CHASE_BOOST.get(state, 0.0)
     if boost and game.turn_limit:
@@ -192,7 +204,8 @@ def evaluation_terms(game, team, start_score):
         terms["progress"] = progress(board, carrier.team) ** config.AI_PROGRESS_CURVE * side
         terms["shot_chance"] = scoring_chance(board, carrier.team, board.ball) * side
         if game.active_team != carrier.team:   # the defenders move next: can they tackle?
-            terms["ball_safety"] = -tackle_threat(board, carrier_tile) * side
+            terms["ball_safety"] = -combined_chance(tackle_attempts(
+                board, carrier_tile, game.stepped, game.actions_remaining)) * side
         else:                                   # the carrier's team moves next: can it shoot?
             terms["shot_threat"] = shot_threat(board, carrier_tile) * side
         options = passing_options(board, carrier_tile, occupied)
@@ -238,45 +251,126 @@ def carrier_exposure(board, carrier_tile):
 
 
 def tackle_threat(board, carrier_tile):
-    """Best tackle chance the carrier's opponents can get on their next turn:
-    from a tile next to the carrier that an opponent is on already or can
-    step to (it must be empty), scored by which side of the carrier it is."""
-    return best_tackle(board, carrier_tile)[0]
+    """Chance the carrier's opponents win the ball on their next turn (all
+    the tackles they can try, see tackle_attempts)."""
+    return combined_chance(tackle_attempts(board, carrier_tile))
+
+
+def combined_chance(attempts):
+    """Chance at least one of the attempts [(chance, ...)] wins."""
+    keep = 1.0
+    for attempt in attempts:
+        keep *= 1 - attempt[0]
+    return 1 - keep
+
+
+_mover_cache = {}
+
+
+def moves_by_action(player):
+    """True if the player has an action that moves them one tile without
+    needing the ball (e.g. reposition), so they can tackle with it."""
+    key = (tuple(player.actions), id(config.ACTIONS))
+    if key not in _mover_cache:
+        found = False
+        for name in player.actions:
+            action = config.ACTIONS.get(name, {})
+            if "possession" in action.get("requires", ()) or "self" not in action:
+                continue
+            if any(hex_distance((0, 0), o) == 1 for o in offset_list(action["self"])):
+                found = True
+                break
+        _mover_cache[key] = found
+    return _mover_cache[key]
+
+
+def tackle_attempts(board, carrier_tile, stepped=(), actions=None):
+    """The tackles the carrier's opponents can try on their (next) turn, best
+    first: [(chance, tile the tackler ends on, where the tackler is now)].
+
+    Free steps: each opponent next to the carrier who hasn't stepped yet
+    (stepped: coordinates that have) can step round them to an empty tile
+    next to both. Each needs a different empty tile, since a tackler who
+    fails stays where they stepped to.
+    One action (if the team has one left; actions=None means a fresh turn):
+    the best of a tackler crossing back after failing, or an opponent two
+    tiles away stepping next to the carrier and then moving across. Needs a
+    one-tile move action without the ball (moves_by_action).
+    Chances are TACKLE_CHANCE for the side they start from, less the shield."""
+    team = carrier_tile.player.team
+    facing = carrier_tile.player.facing
+    centre = carrier_tile.coord
+    ring = [c for c in neighbours(centre) if board.get(c) is not None]
+    empty = {c for c in ring if board.get(c).player is None}
+
+    def side_chance(start):
+        return shielded(config.TACKLE_CHANCE[tackle_side(centre, facing, start)], carrier_tile.player)
+
+    free = []
+    for start in ring:
+        player = board.get(start).player
+        if player is None or player.team == team or start in stepped:
+            continue
+        finishes = [f for f in neighbours(start) if f in empty]
+        chance = side_chance(start)
+        if finishes and chance > 0:
+            free.append((chance, start, finishes))
+    free.sort(key=lambda item: (-item[0], item[1]))
+    attempts, taken = [], set()
+    for chance, start, finishes in free:
+        finish = next((f for f in finishes if f not in taken), None)
+        if finish is not None:
+            taken.add(finish)
+            attempts.append((chance, finish, start))
+
+    if actions is None:
+        actions = config.ACTIONS_PER_TURN.get(other_team(team), 1)
+    if actions >= 1:
+        best = None
+        # A tackler who failed crosses back, from their finish to a free tile
+        free_after = (empty - taken) | {start for _, _, start in attempts}
+        for _, finish, start in attempts:
+            if not moves_by_action(board.get(start).player):
+                continue
+            back = next((g for g in neighbours(finish) if g in free_after and g != finish), None)
+            chance = side_chance(finish)
+            if back is not None and chance > 0 and (best is None or chance > best[0]):
+                best = (chance, back, start)
+        # An opponent two tiles away steps next to the carrier, then moves across
+        for start in empty - taken:
+            chance = side_chance(start)
+            if chance <= 0 or (best is not None and chance <= best[0]):
+                continue
+            finish = next((f for f in neighbours(start) if f in empty and f != start and f not in taken),
+                          None)
+            if finish is None:
+                continue
+            for c in neighbours(start):
+                tile = board.get(c)
+                if (tile is not None and tile.player is not None and tile.player.team != team
+                        and c not in ring and c not in stepped and moves_by_action(tile.player)):
+                    best = (chance, finish, c)
+                    break
+        if best is not None:
+            attempts.append(best)
+            attempts.sort(key=lambda item: -item[0])
+    return attempts
 
 
 def best_tackle(board, carrier_tile):
-    """(chance, tile the tackle is made from, where that opponent is now) for
-    the opponents' best tackle on the carrier next turn, as in tackle_threat.
-    (0.0, None, None) if there's none."""
-    team = carrier_tile.player.team
-    facing = carrier_tile.player.facing
-    best = (0.0, None, None)
-    for direction, coord in enumerate(neighbours(carrier_tile.coord)):
-        tile = board.get(coord)
-        if tile is None:
-            continue
-        side = "front" if is_in_front(facing, direction) else "behind"
-        chance = shielded(config.TACKLE_CHANCE[side], carrier_tile.player)
-        if chance <= best[0]:
-            continue
-        if tile.player is not None:
-            if tile.player.team != team:                  # an opponent already there
-                best = (chance, coord, coord)
-            continue
-        for c in neighbours(coord):                       # an opponent who can step there
-            other = board.get(c)
-            if other is not None and other.player is not None and other.player.team != team:
-                best = (chance, coord, c)
-                break
-    return best
+    """The opponents' single best tackle next turn: (chance, finish, tackler
+    now), or (0.0, None, None). Kept for older callers; the evaluation uses
+    tackle_attempts, which counts every tackle they can try."""
+    attempts = tackle_attempts(board, carrier_tile)
+    return attempts[0] if attempts else (0.0, None, None)
 
 
 def shot_threat(board, carrier_tile):
     """Best chance of scoring the carrier's team can set up on its next turn:
     a shot from where the carrier is, or from up to 1 + carry_range() tiles
     nearer the goal (free step, then an action that moves them with the
-    ball), which needs them to get away from any zone of control tackles
-    first. Ignores blockers."""
+    ball), which needs them to step away without being tackled first
+    (see escape_keep). Ignores blockers."""
     player = carrier_tile.player
     team = player.team
     distance = hex_distance(board.ball, board.goal_attacked_by(team))
@@ -291,19 +385,33 @@ def shot_threat(board, carrier_tile):
 
 def escape_keep(board, coord, team, facing, shield=0.0):
     """Chance that a carrier of team on coord, facing `facing`, keeps the ball
-    when moving away: every opponent next to them gets a zone of control
-    tackle (ZOC_TACKLE_CHANCE by side, less the shield)."""
-    keep = 1.0
-    for direction, near in enumerate(neighbours(coord)):
+    on their safest step: stepping to an empty neighbouring tile goes past
+    every opponent next to both tiles, each with a tackle (TACKLE_CHANCE by
+    side; shields don't count). 1 if any step is clear of them, 0 if there's
+    no empty tile to step to. `shield` is unused (kept for callers)."""
+    opponents = {}
+    for near in neighbours(coord):
         tile = board.get(near)
         if tile is not None and tile.player is not None and tile.player.team != team:
-            side = "front" if is_in_front(facing, direction) else "behind"
-            keep *= 1 - max(0.0, config.ZOC_TACKLE_CHANCE[side] - shield)
-    return keep
+            opponents[near] = config.TACKLE_CHANCE[tackle_side(coord, facing, near)]
+    best = 0.0
+    for step in neighbours(coord):
+        tile = board.get(step)
+        if tile is None or tile.player is not None:
+            continue
+        keep = 1.0
+        for near, chance in opponents.items():
+            if hex_distance(near, step) == 1:
+                keep *= 1 - chance
+        if keep > best:
+            best = keep
+            if best == 1.0:
+                break
+    return best
 
 
 def escape_loss(board, carrier_tile):
-    """Chance the carrier loses the ball to zone of control tackles if they move away."""
+    """Chance the carrier is tackled on their safest step (see escape_keep)."""
     player = carrier_tile.player
     return 1 - escape_keep(board, carrier_tile.coord, player.team, player.facing, player.shield)
 
@@ -390,6 +498,7 @@ def clear_caches():
     _pass_range_cache.clear()
     _pure_turn_cache.clear()
     _kick_cache.clear()
+    _mover_cache.clear()
 
 
 _carry_range_cache = {}
@@ -454,7 +563,18 @@ def progress(board, team):
     as the tiles next to it: you can't shoot from it, so it's no better."""
     to_attack = max(1, hex_distance(board.ball, board.goal_attacked_by(team)))
     to_defend = hex_distance(board.ball, board.goal_attacked_by(other_team(team)))
-    return min(1.0, (to_defend + 1) / max(to_defend + to_attack, 1))
+    return min(1.0, (to_defend + 1) / max(to_defend + to_attack, 1), progress_limit(board))
+
+
+def progress_limit(board):
+    """The most progress counts for: its value on the line between the goals,
+    config.AI_PROGRESS_STOP tiles from the goal being attacked (None: two
+    tiles beyond the longest shot in SHOT_CHANCE)."""
+    stop = config.AI_PROGRESS_STOP
+    if stop is None:
+        stop = max(config.SHOT_CHANCE, default=0) + 2
+    length = hex_distance(board.goals["left"], board.goals["right"])
+    return max(0.0, min(1.0, (length - stop + 1) / max(length, 1)))
 
 
 def pressing(board, team, occupied=None):
@@ -515,7 +635,7 @@ def is_pure_turn(action_name):
     key = (action_name, id(action))
     if key not in _pure_turn_cache:
         _pure_turn_cache[key] = bool(action.get("turn")) and not any(
-            action.get(k) for k in ("self", "ball", "tackle", "shoot"))
+            action.get(k) for k in ("self", "ball", "shoot"))
     return _pure_turn_cache[key]
 
 
@@ -579,18 +699,23 @@ def positioning_step(game):
 
 def move_branches(game, move):
     """[(probability, rolls)] for every way the move can turn out in game:
-    a tackle, zone of control tackles, interceptions, a shot and the keeper's
-    save. [(1.0, [])] if it rolls no dice. Pass the rolls (via a scripted roll
-    function) to reproduce a branch exactly."""
+    a tackle by moving across the carrier, tackles by opponents the carrier
+    goes past, interceptions, a shot and the keeper's save. [(1.0, [])] if it
+    rolls no dice. Pass the rolls (via a scripted roll function) to reproduce
+    a branch exactly."""
     if move == END_TURN:
         return [(1.0, [])]
     tile = game.board.get(move.coord)
     if move.action == STEP:
-        if game.board.ball != move.coord:
-            return [(1.0, [])]
+        if game.board.ball != move.coord:                    # stepping across the carrier?
+            tackle = moving_tackle(game.board, tile, move.target)
+            if tackle is None:
+                return [(1.0, [])]
+            p = tackle[1]
+            return [(q, r) for q, r in ((p, [WIN]), (1 - p, [LOSE])) if q > 0]
         branches, keep = [], 1.0
         rolls = []
-        for _, chance in zoc_tackles(game.board, tile):    # the carrier steps away
+        for _, chance in carry_tackles(game.board, tile, move.target):   # going past opponents
             branches.append((keep * chance, rolls + [WIN]))
             keep *= 1 - chance
             rolls = rolls + [LOSE]
@@ -604,18 +729,17 @@ def move_branches(game, move):
 def may_roll(action_name):
     """Quick check: could this action ever roll dice with the current config?"""
     action = config.ACTIONS[action_name]
-    if action.get("tackle") or action.get("shoot"):
+    if action.get("shoot"):
         return True
-    if action.get("lofted"):
-        return False            # lofted balls and carries escape both
-    if action.get("ball") == WITH_PLAYER:
-        return "self" in action and any(config.ZOC_TACKLE_CHANCE.values())
+    if "self" in action and any(config.TACKLE_CHANCE.values()):
+        return True             # moving across the carrier, or past opponents with the ball
+    if action.get("lofted") or action.get("ball") == WITH_PLAYER:
+        return False
     return "ball" in action and config.INTERCEPT_CHANCE > 0
 
 
 def deterministic(move, game):
-    """True if the move rolls no dice in game (no tackle, shot, zone of
-    control tackle or interception)."""
+    """True if the move rolls no dice in game (no tackle, shot or interception)."""
     return move_branches(game, move) == [(1.0, [])]
 
 

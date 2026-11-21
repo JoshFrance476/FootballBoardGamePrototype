@@ -18,7 +18,7 @@ whole turn at once and checks it against the opponent's best reply:
      their dice. The best-scoring plan is played.
 
 A plan stops at the first move that rolls dice (a tackle, a shot, or a move
-that risks a zone of control tackle or an interception): what to
+that risks being tackled going past someone, or an interception): what to
 do next depends on the result, so the rest of the turn is planned again once
 it's known. For scoring, the turn after such a move is finished greedily for
 each possible result.
@@ -65,7 +65,7 @@ def after(game, move, rolls=None):
 
 def dice_results(game, move):
     """[(probability, rolls)] for each way a move with dice can turn out:
-    tackles, zone of control tackles, interceptions, shots and saves."""
+    tackles, interceptions, shots and saves."""
     return move_branches(game, move)
 
 
@@ -209,12 +209,18 @@ def candidate_turns(game, width, count, deadline):
 
 def plan_kind(plan):
     """What a plan does with the ball: "shot", "tackle", "ball" (it moves the
-    ball, or risks it to a zone of control tackle or an interception) or
+    ball, or risks it to a tackle or an interception) or
     "hold" (the ball stays where it is)."""
     last = plan.moves[-1]
     if plan.final is None:                      # it ends with a move that rolls dice
         action = {} if last.action == STEP else config.ACTIONS[last.action]
-        return "shot" if action.get("shoot") else "tackle" if action.get("tackle") else "ball"
+        if action.get("shoot"):
+            return "shot"
+        board = plan.chance_state.board
+        holder, mover = board.get(board.ball).player, board.get(last.coord).player
+        if holder is not None and holder.team != mover.team:
+            return "tackle"                     # moving across the carrier
+        return "ball"
     def holder(board):
         tile = board.get(board.ball)
         return None if tile.player is None else tile.player.team

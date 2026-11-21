@@ -58,6 +58,42 @@ BUTTON_ACTIVE_TEXT_COLOUR = BLACK
 BUTTON_DISABLED_COLOUR = LIGHT_GREY   # can't be used right now
 BUTTON_DISABLED_TEXT_COLOUR = MID_GREY
 
+TEXT_COLOUR = BLACK                   # writing on the background and panels
+FAINT_TEXT_COLOUR = MID_GREY          # hints and greyed-out labels
+ERROR_COLOUR = (190, 0, 0)
+INPUT_COLOUR = WHITE                  # inside a text box
+STRIPE_COLOUR = (228, 228, 228)       # every other row of the rankings table
+HIGHLIGHT_ROW_COLOUR = (255, 236, 160)  # your row in the rankings table
+
+# Dark mode: switch it on the main menu or the pause menu (Save to config.py
+# keeps it). While it's on, each colour named here replaces the one above.
+DARK_MODE = False
+
+# Replays: every finished match is saved here (relative to the game's folder)
+REPLAY_FOLDER = "replays"
+
+# Fullscreen (F11, or the button on the main menu / pause menu; Save to
+# config.py keeps it): the game stays SCREEN_SIZE in the middle, black around it.
+FULLSCREEN = False
+DARK_MODE_COLOURS = {
+    "BACKGROUND_COLOUR": (28, 30, 34),
+    "TEXT_COLOUR": (232, 232, 235),
+    "FAINT_TEXT_COLOUR": (145, 148, 155),
+    "ERROR_COLOUR": (255, 120, 120),
+    "FULL_TIME_PANEL_COLOUR": (48, 51, 58),
+    "FULL_TIME_SHADE": (0, 0, 0, 150),
+    "BUTTON_COLOUR": (78, 82, 94),
+    "BUTTON_TEXT_COLOUR": (240, 240, 242),
+    "BUTTON_DISABLED_COLOUR": (48, 50, 56),
+    "BUTTON_DISABLED_TEXT_COLOUR": (105, 108, 115),
+    "INPUT_COLOUR": (42, 44, 50),
+    "STRIPE_COLOUR": (40, 43, 49),
+    "HIGHLIGHT_ROW_COLOUR": (95, 82, 28),
+    "PITCH_GREEN": (0, 96, 0),
+    "BOX_COLOUR": (0, 78, 0),
+    "MID_GREY": (110, 113, 120),
+}
+
 # --- Teams ---
 HOME = 0
 AWAY = 1
@@ -84,7 +120,7 @@ ACTIONS_PER_TURN = {HOME: 1, AWAY: 1}
 # Extra actions the team earns the first time each player has the ball in a
 # turn (on top of the one action every turn starts with), by how they got it:
 START_POSSESSION_ACTIONS = 1  # a player has the ball when the turn starts
-TACKLE_POSSESSION_ACTIONS = 1  # a player wins the ball with a tackle
+TACKLE_POSSESSION_ACTIONS = 1  # a player wins the ball by moving across the carrier
 RECEIVE_POSSESSION_ACTIONS = 1  # any other way: receiving a pass, picking up a loose ball
 
 # Match length: turns for each team. Turns alternate (the team that concedes
@@ -116,25 +152,27 @@ RANKING_LOSS_HALF_GAP = 300
 # Actions never change facing unless they have "turn": True.
 RIGHT, LEFT = 0, 3   # same values as hex_math.RIGHT / hex_math.LEFT
 
-# Chance a tackle wins the ball, by which side of the ball carrier the
-# tackler is on. "front" is the three neighbouring tiles on the side the
-# carrier is facing, "behind" the three on the other side.
+# Tackling: there's no tackle action. A player tackles by moving (free step
+# or any action that moves them) from a tile next to the opponent with the
+# ball to another tile next to them - a single step round them counts. Won
+# or not, they end up where they were going, with the ball if it won.
+# Going past works the other way round: a carrier who moves from a tile next
+# to an opponent to another tile next to that opponent gives them a tackle;
+# if it wins the ball goes to that opponent and the carrier still moves.
+# Moving straight away from an opponent is safe. A lofted carry escapes.
+# Chance, by which side of the carrier the tackler is on ("front" is the
+# three neighbouring tiles on the side the carrier faces, "behind" the other
+# three): for a tackle by moving across, where the tackler starts; for going
+# past, where the opponent is. Shields only count against moving across.
 TACKLE_CHANCE = {
     "front": 0.8,
     "behind": 0.4,
 }
 
-# Zone of control: when a player with the ball moves to another tile (their
-# free step, or an action that carries the ball), every opponent next to them
-# first gets a free tackle, best chance first, by which side of the carrier
-# they're on ("front" = the side the carrier faces before moving). If one
-# wins, the carrier stays where they were and the ball goes to that opponent;
-# otherwise the move goes ahead. A lofted carry ("lofted" with "with_player")
-# escapes it. 0 turns it off.
-ZOC_TACKLE_CHANCE = {
-    "front": 0.5,
-    "behind": 0.25,
-}
+# Moves longer than one tile: "path" checks every step along the move's
+# straight line (a two-tile run can cross or pass someone on the way),
+# "ends" only where the move starts and finishes.
+TACKLE_MOVE_CHECK = "path"
 
 # Interceptions: a pass that isn't lofted gives every opponent next to a tile
 # it crosses (not the passer's or the destination tile) this chance, once for
@@ -165,12 +203,7 @@ SHOT_CHANCE = {
 
 # Actions a player can take. Each one combines any of these effects (it
 # needs at least one), applied in this order:
-#   "tackle":   True to try to take the ball from an opponent on a
-#               neighbouring tile onto the player's tile, with a chance from
-#               TACKLE_CHANCE. Only usable when an opponent next to the
-#               player has the ball; click that opponent to do it. If it
-#               fails, the rest of the action doesn't happen. If it works,
-#               the player has the ball for the rest of the action.
+
 #   "self":     offset the player moves by. The tile must be empty.
 #   "ball":     offset the ball moves to, from the player's tile. Only
 #               applies when the player has the ball, so "self" and "ball"
@@ -200,8 +233,8 @@ SHOT_CHANCE = {
 #               which way the player faces, even if it moves them.
 #   An action can offer only one choice: a "self" list or a "ball" list, so
 #   one click always settles it.
-#   "shield":   an amount from 0 to 1 taken off the chance of any tackle on
-#               the player (normal or zone of control) afterwards, e.g. 0.3
+#   "shield":   an amount from 0 to 1 taken off the chance of an opponent
+#               tackling the player by moving across them, e.g. 0.3
 #               turns an 80% tackle into 50%. Lasts until the start of their
 #               team's next turn, or until the player moves. Shields don't add
 #               up: a second one only counts if it's bigger.
@@ -262,9 +295,7 @@ ACTIONS = {
         "ball": [(-1, -1), (-2, 1), (-2, 0), (-1, 0)],
         "lofted": True,
     },
-    "tackle": {                 # try to win the ball from an adjacent opponent
-        "tackle": True,
-    },
+
     "shoot": {
         "requires": ["possession"],
         "shoot": True,
@@ -319,8 +350,8 @@ FACING_HALF_WIDTH = 6  # half the width of the back edge
 # Add "facing": RIGHT or LEFT to an entry to override TEAM_FACING, and
 # "role": "goalkeeper" for a keeper.
 OUTFIELD_ACTIONS = ["reposition", "dribble", "sprint", "pass", "lob", "pass and move",
-                    "backheel", "tackle", "shoot", "shield", "cross"]
-KEEPER_ACTIONS = ["reposition", "pass", "drop-kick", "throw", "tackle"]
+                    "backheel", "shoot", "shield", "cross"]
+KEEPER_ACTIONS = ["reposition", "pass", "drop-kick", "throw"]
 
 # Most actions any one player can have, counting DEFAULT_ACTIONS (0 = no limit).
 # A player can have their own list instead of a shared set: edit it in the
@@ -393,6 +424,11 @@ AI_DEBUG = False          # print the AI's top candidate moves to the console
 # weight and each tile in the final third worth more, so the AI risks the ball
 # to attack instead of sitting on it.
 AI_PROGRESS_CURVE = 2.0
+# Tiles from the goal at which "progress" stops growing. Closer than this the
+# ball is worth only the shot it sets up ("shot_chance", "shot_threat"), so the
+# AI shoots instead of holding the ball in the box or by the corner flag.
+# None = two tiles beyond the longest shot in SHOT_CHANCE (5 with shots up to 3).
+AI_PROGRESS_STOP = None
 
 # How the AI judges a position at the end of its lookahead. See ai.evaluate.
 # Every term counts for the team it describes and against its opponent.
@@ -415,13 +451,13 @@ AI_WEIGHTS = {
     "loose_ball": 0.15,    # nobody has it: your nearest player closer to it than theirs
     "progress": 0.9,       # holding the ball: 0 at your own goal up to this at theirs (curved)
     "shot_chance": 0.15,   # times the shot chance from where the ball is, for its holder
-    "ball_safety": 0.15,   # minus the best tackle chance opponents can set up on your carrier next turn
+    "ball_safety": 0.15,   # minus the chance opponents win the ball next turn (every tackle they can try)
     "shot_threat": 0.45,   # the best shot chance your carrier can set up next turn
     "support": 0.1,        # how safely the carrier can pass to each teammate (interceptions, markers)
     "cover": 0.1,          # defending a carrier: fraction of players goal-side of the ball
     "pressing": 0.08,      # defending a carrier: a player next to them (1) or 2 tiles away (0.5)
     "runs": 0.08,          # with the ball: fraction of teammates ahead of it and unmarked
-    "trapped": 0.15,       # with the ball: chance of losing it to zone tackles if the carrier must move, less a safe pass out
+    "trapped": 0.15,       # with the ball: chance of being tackled on the carrier's safest step, less a safe pass out
 }
 # Keep possession + progress + shot_chance well below "goal": holding the ball
 # next to goal has to be worth less than an 80% shot, or the AI stops shooting.
@@ -429,9 +465,10 @@ AI_WEIGHTS = {
 # the ball by the end of the lookahead; at 1.0 an unopposed 80% shot looked
 # worse than just keeping the ball.
 # With these values and AI_PROGRESS_CURVE 2: holding the ball in midfield is
-# worth ~0.3, a tile gained ~0.07 in midfield and ~0.13 in the final third, and
-# the AI shoots from 1-2 tiles. Lower progress or a curve of 1 make it sit on
-# the ball: holding safely beats the risk of losing it going forward.
+# worth ~0.2, a tile gained ~0.1 up to AI_PROGRESS_STOP, and the AI shoots
+# from 3 tiles if it can't get closer that turn. Lower progress or a curve of
+# 1 make it sit on the ball: holding safely beats the risk of losing it going
+# forward.
 
 # Added by the in-game menu
 SHIFTED_ROWS = "top"

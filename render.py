@@ -282,11 +282,11 @@ class Renderer:
     def draw_score(self, game):
         label = (f"{config.TEAM_NAMES[config.HOME]}  {game.score[config.HOME]}"
                  f"  -  {game.score[config.AWAY]}  {config.TEAM_NAMES[config.AWAY]}")
-        text = self.button_font.render(label, True, config.BLACK)
+        text = self.button_font.render(label, True, config.TEXT_COLOUR)
         rect = self.screen.blit(text, text.get_rect(midtop=(config.SCREEN_SIZE[0] // 2, config.SCORE_Y)))
         if game.turn_limit is not None:
             clock = "Full time" if game.over else f"Turn {game.turn_number} of {game.turn_limit}"
-            text = self.button_font.render(clock, True, config.BLACK)
+            text = self.button_font.render(clock, True, config.TEXT_COLOUR)
             self.screen.blit(text, text.get_rect(topright=(config.SCREEN_SIZE[0] - 10, config.SCORE_Y)))
 
     def draw_full_time(self, game, choices=FULL_TIME_CHOICES, lines=()):
@@ -297,12 +297,12 @@ class Renderer:
         panel = full_time_panel(len(lines))
         pygame.draw.rect(self.screen, config.FULL_TIME_PANEL_COLOUR, panel,
                          border_radius=config.BUTTON_RADIUS * 2)
-        title = self.font.render("Full time", True, config.BLACK)
+        title = self.font.render("Full time", True, config.TEXT_COLOUR)
         self.screen.blit(title, title.get_rect(midtop=(panel.centerx, panel.top + 20)))
-        result = self.button_font.render(game.result_text(), True, config.BLACK)
+        result = self.button_font.render(game.result_text(), True, config.TEXT_COLOUR)
         self.screen.blit(result, result.get_rect(midtop=(panel.centerx, panel.top + 60)))
         for i, line in enumerate(lines):
-            text = self.button_font.render(line, True, config.BLACK)
+            text = self.button_font.render(line, True, config.TEXT_COLOUR)
             y = panel.top + 60 + (i + 1) * FULL_TIME_LINE_HEIGHT
             self.screen.blit(text, text.get_rect(midtop=(panel.centerx, y)))
         for name, rect in full_time_buttons(choices, len(lines)).items():
@@ -312,13 +312,13 @@ class Renderer:
         """Whose turn it is, what they have left underneath, then the status message."""
         if game.over:
             return
-        text = self.font.render(config.TEAM_NAMES[game.active_team], True, config.BLACK)
+        text = self.font.render(config.TEAM_NAMES[game.active_team], True, config.TEXT_COLOUR)
         rect = self.screen.blit(text, config.UI_POSITION)
         budget = f"Actions left: {game.actions_left()}    Steps left: {game.steps_left()}"
-        self.screen.blit(self.button_font.render(budget, True, config.BLACK),
+        self.screen.blit(self.button_font.render(budget, True, config.TEXT_COLOUR),
                          (config.UI_POSITION[0], rect.bottom))
         if game.status:
-            status = self.button_font.render(game.status, True, config.BLACK)
+            status = self.button_font.render(game.status, True, config.TEXT_COLOUR)
             self.screen.blit(status, status.get_rect(midleft=(rect.right + 20, rect.centery)))
 
     def draw_button(self, rect, label, fill, text_colour):
