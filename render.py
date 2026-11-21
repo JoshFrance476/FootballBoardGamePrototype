@@ -289,6 +289,34 @@ class Renderer:
             text = self.button_font.render(clock, True, config.TEXT_COLOUR)
             self.screen.blit(text, text.get_rect(topright=(config.SCREEN_SIZE[0] - 10, config.SCORE_Y)))
 
+    def draw_tooltip(self, lines, pos):
+        """A small box of text lines just below-right of pos (the mouse),
+        kept on the screen."""
+        if not lines:
+            return
+        font = self.tooltip_font()
+        rendered = [font.render(line, True, config.TEXT_COLOUR) for line in lines]
+        pad, gap = 8, 2
+        width = max(surface.get_width() for surface in rendered) + 2 * pad
+        height = sum(surface.get_height() for surface in rendered) + gap * (len(rendered) - 1) + 2 * pad
+        box = pygame.Rect(pos[0] + 16, pos[1] + 18, width, height)
+        if box.right > config.SCREEN_SIZE[0] - 4:
+            box.right = pos[0] - 8
+        if box.bottom > config.SCREEN_SIZE[1] - 4:
+            box.bottom = pos[1] - 8
+        box.clamp_ip(self.screen.get_rect())
+        pygame.draw.rect(self.screen, config.FULL_TIME_PANEL_COLOUR, box, border_radius=6)
+        pygame.draw.rect(self.screen, config.TOOLTIP_BORDER_COLOUR, box, 1, border_radius=6)
+        y = box.top + pad
+        for surface in rendered:
+            self.screen.blit(surface, (box.left + pad, y))
+            y += surface.get_height() + gap
+
+    def tooltip_font(self):
+        if getattr(self, "_tooltip_font", None) is None:
+            self._tooltip_font = pygame.font.SysFont(config.FONT_NAME, config.TOOLTIP_FONT_SIZE)
+        return self._tooltip_font
+
     def draw_full_time(self, game, choices=FULL_TIME_CHOICES, lines=()):
         """Dim the screen and show the result, any extra lines, and the choice buttons."""
         shade = pygame.Surface(config.SCREEN_SIZE, pygame.SRCALPHA)

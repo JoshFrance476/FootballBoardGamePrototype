@@ -87,6 +87,7 @@ class Game:
         self.selected = None      # the Tile whose player is selected (either team), or None
         self.action = None        # name of the action awaiting a target click, or None
         self.hover_action = None  # name of the action button under the mouse, or None
+        self.hover_tile = None    # coordinate of the tile under the mouse, or None
         # Holding the ball at the start of the turn counts as a first possession
         self._check_new_carrier(config.START_POSSESSION_ACTIONS)
 
@@ -112,6 +113,7 @@ class Game:
         copy.selected = None
         copy.action = None
         copy.hover_action = None
+        copy.hover_tile = None
         return copy
 
     def snapshot(self):
@@ -389,61 +391,53 @@ class Game:
 
     @property
     def status(self):
-        """Text for the status line: the chosen (or hovered) action's chances,
-        or the last result."""
+        """Text for the status line: what the chosen (or hovered) action can do,
+        or the last result. The chances for a particular tile are in the
+        tooltip (hover_chances)."""
+        hint = "hover over a highlighted tile to see its chances"
         if self.preview_action is not None:
             options = self.preview_options.values()
-            parts = []
-            tackles = sorted({o.tackle_chance for o in options if o.tackle_from is not None})
-            shots = sorted({o.score_chance for o in options if o.shot_at is not None})
-            saves = sorted({o.save_chance for o in options if o.shot_at is not None and o.save_chance})
-            if tackles:
-                parts.append("Tackle " + " / ".join(map(percent, tackles)))
-            if shots:
-                parts.append("Score " + " / ".join(map(percent, shots)))
-            if saves:
-                parts.append("keeper saves " + " / ".join(map(percent, saves)))
-            losses = sorted({o.loss_chance for o in options if o.loss_chance > 0})
-            if losses:
-                parts.append("lose the ball " + " / ".join(map(percent, losses)))
             if not self.preview_usable:
                 if not self.preview_options:
                     return f"Can't {self.preview_action} from here"
-                return (f"Can't {self.preview_action} now: showing where it would go"
-                        + (f" ({', '.join(parts)})" if parts else ""))
-            if parts:
-                return "Chance: " + ", ".join(parts)
+                return f"Can't {self.preview_action} now: showing where it would go"
+            if any(chance_lines(o) for o in options):
+                return f"{self.preview_action.capitalize()}: {hint}"
         elif self.viewing_opponent:
             return (f"Viewing a {config.TEAM_NAMES[self.selected.player.team]} player: "
                     f"hover over an action to see where it goes")
-        elif self.selected is not None and self.selected_step_targets:
-            risk = self.step_tackle_note()
-            if risk:
-                return f"{self.message} - {risk}" if self.message else risk
+        elif self.selected is not None and any(self.step_chances(t) for t in self.selected_step_targets):
+            note = f"Steps with a tackle: {hint}"
+            return f"{self.message} - {note}" if self.message else note
         return self.message
 
-    def step_tackle_note(self):
-        """What stepping the selected player could do with tackles: the risk
-        of going past opponents with the ball, or the chance of tackling by
-        stepping across the carrier. "" if none of their steps involve one."""
+    def hover_chances(self):
+        """Lines for the tooltip over the tile under the mouse (hover_tile):
+        the chances of the chosen (or hovered) action aimed there, or of the
+        selected player stepping there. [] if there's nothing to show."""
+        coord = self.hover_tile
+        if coord is None or self.selected is None or self.selected.player is None:
+            return []
+        if self.preview_action is not None:
+            outcome = self.preview_options.get(coord)
+            if outcome is None:
+                return []
+            lines = chance_lines(outcome)
+            if lines and not self.preview_usable:
+                lines.insert(0, f"If you could {self.preview_action} now:")
+            return lines
+        if not self.viewing_opponent and coord in self.selected_step_targets:
+            return self.step_chances(coord)
+        return []
+
+    def step_chances(self, target, show_safe=False):
+        """Tooltip lines for the selected player's free step to target."""
         tile = self.selected
         if self.board.ball == tile.coord:
-            losses = []
-            for target in self.selected_step_targets:
-                keep = 1.0
-                for _, chance in carry_tackles(self.board, tile, target):
-                    keep *= 1 - chance
-                if keep < 1:
-                    losses.append(1 - keep)
-            if losses:
-                worst = max(losses)
-                return f"Stepping past an opponent: up to {percent(worst)} chance of being tackled"
-            return ""
-        chances = sorted({t[1] for t in (moving_tackle(self.board, tile, target)
-                                         for target in self.selected_step_targets) if t})
-        if chances:
-            return "Stepping across the ball carrier tackles: " + " / ".join(map(percent, chances))
-        return ""
+            past = carry_tackles(self.board, tile, target)
+            return past_lines(past) if past else (["No risk of losing the ball"] if show_safe else [])
+        tackle = moving_tackle(self.board, tile, target)
+        return [f"Tackle: {percent(tackle[1])} to win the ball"] if tackle else []
 
     # --- Human input ---
 
@@ -487,3 +481,46 @@ class Game:
         elif tile.player is None:
             self.selected = None
             self.action = None
+
+
+def past_lines(tackles):
+    """Tooltip lines for the tackles of opponents a carrier goes past."""
+    keep = 1.0
+    for _, chance in tackles:
+        keep *= 1 - chance
+    line = f"Tackled going past: {percent(1 - keep)}"
+    if len(tackles) > 1:
+        line += " (" + " then ".join(percent(c) for _, c in tackles) + ")"
+    return [line]
+
+
+def chance_lines(outcome, show_safe=False):
+    """Tooltip lines with the exact chances of one Outcome: a tackle by
+    moving across the carrier, being tackled going past opponents, the
+    pass being intercepted, and a shot scoring. show_safe: say so when the
+    ball moves with no risk at all."""
+    lines = []
+    if outcome.tackle_from is not None:
+        lines.append(f"Tackle: {percent(outcome.tackle_chance)} to win the ball")
+    if outcome.carry_tackles:
+        lines += past_lines(outcome.carry_tackles)
+    if outcome.intercepts:
+        keep = 1.0
+        for _, chance in outcome.intercepts:
+            keep *= 1 - chance
+        line = f"Intercepted: {percent(1 - keep)}"
+        if len(outcome.intercepts) > 1:
+            line += f" ({len(outcome.intercepts)} chances of {percent(outcome.intercepts[0][1])})"
+        lines.append(line)
+    if outcome.shot_at is not None:
+        lines.append(f"Scores: {percent(outcome.score_chance)}")
+        details = []
+        if outcome.shot_chance < 1:
+            details.append(f"on target {percent(outcome.shot_chance)}")
+        if outcome.save_chance:
+            details.append(f"keeper saves {percent(outcome.save_chance)}")
+        if details:
+            lines.append("(" + ", ".join(details) + ")")
+    if not lines and show_safe and outcome.ball_to is not None:
+        lines.append("No risk of losing the ball")
+    return lines

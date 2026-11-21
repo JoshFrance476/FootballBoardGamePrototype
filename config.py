@@ -58,6 +58,8 @@ BUTTON_ACTIVE_TEXT_COLOUR = BLACK
 BUTTON_DISABLED_COLOUR = LIGHT_GREY   # can't be used right now
 BUTTON_DISABLED_TEXT_COLOUR = MID_GREY
 
+TOOLTIP_FONT_SIZE = 18                # the chances shown by the mouse
+TOOLTIP_BORDER_COLOUR = MID_GREY
 TEXT_COLOUR = BLACK                   # writing on the background and panels
 FAINT_TEXT_COLOUR = MID_GREY          # hints and greyed-out labels
 ERROR_COLOUR = (190, 0, 0)

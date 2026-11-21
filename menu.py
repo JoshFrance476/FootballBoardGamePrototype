@@ -948,8 +948,12 @@ class GameScreen(Screen):
             self.app.push(PauseScreen(self.app, self))
             return True
         if event.type == pygame.MOUSEMOTION:
-            # Hovering over an action button previews where it goes
+            # Hovering over an action button previews where it goes; over a
+            # tile, the tooltip shows that tile's chances
             self.game.hover_action = None if self.ai_turn() else action_at_pixel(event.pos, self.game)
+            tile = tile_at_pixel(event.pos, self.game.board)
+            self.game.hover_tile = None if tile is None else tile.coord
+            self.mouse = event.pos
             return False
         if event.type != pygame.MOUSEBUTTONDOWN or event.button != 1:
             return False
@@ -986,6 +990,9 @@ class GameScreen(Screen):
                                self.full_time() if self.game.over else None)
         if not self.game.over:
             ui.text(screen, "Esc: menu", (10, 6), size=15, colour=ui.FAINT_TEXT_COLOUR)
+        if not self.game.over and not self.ai_turn():
+            self.app.renderer.draw_tooltip(self.game.hover_chances(),
+                                           getattr(self, "mouse", None) or ui.mouse_pos())
         marks = len(self.timestamps) + (len(self.replay_record["timestamps"])
                                         if self.replay_record else 0)
         label = "+ timestamp" + (f" ({marks})" if marks else "")

@@ -262,7 +262,7 @@ def frame_game(record, index):
     game.active_team = state["team"]
     game.actions_remaining = state["actions"]
     game.had_ball, game.stepped, game.last_actions = set(), set(), {}
-    game.selected = game.action = game.hover_action = None
+    game.selected = game.action = game.hover_action = game.hover_tile = None
     return game
 
 

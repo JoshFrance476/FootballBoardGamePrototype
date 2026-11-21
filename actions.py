@@ -89,6 +89,7 @@ def config_defaults():
         "HIGHLIGHT_ROW_COLOUR": (255, 236, 160),
         "DARK_MODE": False, "DARK_MODE_COLOURS": {}, "FULLSCREEN": False,
         "AI_PROGRESS_STOP": None, "REPLAY_FOLDER": "replays",
+        "TOOLTIP_FONT_SIZE": 18, "TOOLTIP_BORDER_COLOUR": (140, 140, 140),
         "INTERCEPT_CHANCE": 0.0,            # 0 = no interceptions
         "MAX_PLAYER_ACTIONS": 0,            # 0 = no limit
         "SHIFTED_ROWS": "second",           # which rows sit half a tile across
