@@ -898,13 +898,122 @@ class GameScreen(Screen):
         self.timestamps = []            # [(frame index, note)] added during the match
         self.replay_path = None         # set once saved at full time
         self.replay_record = None
+        self.match_record = replay_module.match_record(self.game)   # for rewinding
+        self.history = None             # the frame being looked back at, or None for live
+        self.history_playing = False
+        self.history_next = 0.0
+
+    # --- Rewinding the match ---
+    # A bar of small buttons at the top left goes back through the match so
+    # far, move by move or turn by turn. While looking back, the match (and
+    # the AI) waits; Live goes back to it. Keys: Left / Right a move,
+    # PageUp / PageDown a turn, Home the kick-off, End live, Space play.
+
+    HISTORY_BUTTONS = [("start", "|<", 30), ("turn back", "<<", 30), ("back", "<", 30),
+                       ("forward", ">", 30), ("turn forward", ">>", 30), ("play", "Play", 46),
+                       ("live", "Live", 46)]
+    HISTORY_PLAY_SPEED = 2.0            # moves a second when playing forward
+
+    def history_rects(self):
+        rects, x = {}, 8
+        for name, _, width in self.HISTORY_BUTTONS:
+            rects[name] = pygame.Rect(x, 46, width, 22)
+            x += width + 4
+        return rects
+
+    def live_index(self):
+        return len(self.game.frames) - 1
+
+    def viewing(self):
+        """The frame on show: the one looked back at, or the latest."""
+        return self.live_index() if self.history is None else self.history
+
+    def rewind_to(self, index):
+        index = max(0, index)
+        if index >= self.live_index():
+            self.go_live()
+        else:
+            self.history = index
+            self.game.hover_action = self.game.hover_tile = None
+
+    def go_live(self):
+        self.history = None
+        self.history_playing = False
+
+    def turn_back(self):
+        starts = [s for s in replay_module.turn_starts(self.match_record) if s < self.viewing()]
+        self.rewind_to(starts[-1] if starts else 0)
+
+    def turn_forward(self):
+        later = [s for s in replay_module.turn_starts(self.match_record) if s > self.viewing()]
+        self.rewind_to(later[0] if later else self.live_index())
+
+    def toggle_history_play(self):
+        if self.history is not None:
+            self.history_playing = not self.history_playing
+            self.history_next = time.perf_counter() + 1 / self.HISTORY_PLAY_SPEED
+
+    def history_enabled(self, name):
+        if name in ("start", "turn back", "back"):
+            return self.viewing() > 0
+        return self.history is not None
+
+    def history_command(self, name):
+        if not self.history_enabled(name):
+            return
+        {"start": lambda: self.rewind_to(0),
+         "turn back": self.turn_back,
+         "back": lambda: self.rewind_to(self.viewing() - 1),
+         "forward": lambda: self.rewind_to(self.viewing() + 1),
+         "turn forward": self.turn_forward,
+         "play": self.toggle_history_play,
+         "live": self.go_live}[name]()
+
+    def handle_history(self, event):
+        """Rewind controls; True if the event was one of them."""
+        if event.type == pygame.KEYDOWN:
+            keys = {pygame.K_LEFT: "back", pygame.K_RIGHT: "forward",
+                    pygame.K_PAGEUP: "turn back", pygame.K_PAGEDOWN: "turn forward",
+                    pygame.K_HOME: "start", pygame.K_END: "live", pygame.K_SPACE: "play"}
+            if event.key in keys:
+                self.history_command(keys[event.key])
+                return True
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            for name, rect in self.history_rects().items():
+                if rect.collidepoint(event.pos):
+                    self.history_command(name)
+                    return True
+        return False
+
+    def draw_history_bar(self, screen):
+        rects = self.history_rects()
+        for name, label, _ in self.HISTORY_BUTTONS:
+            if name == "play":
+                label = "Pause" if self.history_playing else "Play"
+            active = (name == "play" and self.history_playing)
+            ui.draw_box(screen, rects[name], label,
+                        *ui.colours(self.history_enabled(name), active), size=13)
+
+    def draw_history(self, screen):
+        """The match as it was at the frame looked back at."""
+        screen.fill(config.BACKGROUND_COLOUR)
+        draw_frame(self.app.renderer, self.match_record, self.history)
+        x, y = config.UI_POSITION
+        where = replay_module.position_text(self.match_record, self.history)
+        ui.text(screen, f"Looking back: {where}", (x, y), size=22, bold=True)
+        ui.text(screen, fit(replay_module.describe_move(self.match_record, self.history), WIDTH - 2 * x, 16),
+                (x, y + 30), size=16)
+        ui.text(screen, "The match is paused. Live (or End) goes back to it.  "
+                        "Left/Right: a move   PageUp/PageDown: a turn   Home: kick-off   Space: play",
+                (x, y + 58), size=13, colour=ui.FAINT_TEXT_COLOUR)
 
     def controllers(self):
         return dict(self.ai.controllers or config.CONTROLLERS)
 
     def add_timestamp(self, note):
-        """Note the current moment; written into the replay (now, if it's saved already)."""
-        index = len(self.game.frames) - 1
+        """Note the moment on show (the current one, or the one looked back at);
+        written into the replay (now, if it's saved already)."""
+        index = self.viewing()
         if self.replay_record is None:
             self.timestamps.append((index, note))
         else:
@@ -941,6 +1050,15 @@ class GameScreen(Screen):
         if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
             self.app.push(PauseScreen(self.app, self))
             return True
+        if self.handle_history(event):
+            return True
+        if self.history is not None:            # looking back: only the timestamp works
+            if (event.type == pygame.MOUSEBUTTONDOWN and event.button == 1
+                    and self.MARK_RECT.collidepoint(event.pos)):
+                self.app.push(NoteScreen(self.app, "Timestamp at turn "
+                                         f"{replay_module.frame_turn(self.match_record, self.history)}",
+                                         "", self.add_timestamp, self))
+            return True
         if event.type == pygame.MOUSEMOTION:
             # Hovering over an action button previews where it goes; over a
             # tile, the tooltip shows that tile's chances
@@ -973,6 +1091,11 @@ class GameScreen(Screen):
         return True
 
     def update(self):
+        if self.history is not None:        # looking back: the match waits
+            if self.history_playing and time.perf_counter() >= self.history_next:
+                self.rewind_to(self.history + 1)
+                self.history_next = time.perf_counter() + 1 / self.HISTORY_PLAY_SPEED
+            return
         if self.ai_turn():
             self.game.hover_action = None   # the computer's choice is on show
         self.ai.update(self.game)
@@ -980,11 +1103,15 @@ class GameScreen(Screen):
             self.save_replay()
 
     def draw(self, screen):
-        self.app.renderer.draw(self.game, self.ai_turn(), self.ai.highlight,
-                               self.full_time() if self.game.over else None)
-        if not self.game.over:
+        if self.history is not None:
+            self.draw_history(screen)
+        else:
+            self.app.renderer.draw(self.game, self.ai_turn(), self.ai.highlight,
+                                   self.full_time() if self.game.over else None)
+        if not self.game.over or self.history is not None:
             ui.text(screen, "Esc: menu", (10, 6), size=15, colour=ui.FAINT_TEXT_COLOUR)
-        if not self.game.over and not self.ai_turn():
+        self.draw_history_bar(screen)
+        if not self.game.over and not self.ai_turn() and self.history is None:
             self.app.renderer.draw_route(self.game.hover_route())
             self.app.renderer.draw_tooltip(self.game.hover_chances(),
                                            getattr(self, "mouse", None) or ui.mouse_pos())
@@ -1034,6 +1161,27 @@ class RankedGameScreen(GameScreen):
             self.app.pop()
         elif choice == "quit":
             self.app.quit()
+
+
+def draw_frame(renderer, record, index):
+    """Draw the pitch, ball and score of a recorded position, with the
+    move that led to it marked: where the player started (cyan) and ended
+    up (yellow)."""
+    frame = record["frames"][index]
+    move = frame["move"] or {}
+    start = tuple(move["from"]) if move.get("from") else None
+    end = tuple(move["to"]) if move.get("to") else None
+    with replay_module.pitch_settings(record):
+        game = replay_module.frame_game(record, index)
+        for tile in game.board:
+            border = None
+            if tile.coord == end:
+                border = (config.SELECTED_COLOUR, config.SELECTED_BORDER_WIDTH)
+            elif tile.coord == start:
+                border = (config.STEP_TARGET_COLOUR, config.STEP_TARGET_WIDTH)
+            renderer.draw_tile(tile, border, game.board)
+        renderer.draw_ball(game.board.ball)
+        renderer.draw_score(game)
 
 
 # --- Replays ---
@@ -1441,22 +1589,7 @@ class ReplayScreen(Screen):
 
     def draw(self, screen):
         screen.fill(config.BACKGROUND_COLOUR)
-        renderer = self.app.renderer
-        frame = self.frames[self.index]
-        move = frame["move"] or {}
-        start = tuple(move["from"]) if move.get("from") else None
-        end = tuple(move["to"]) if move.get("to") else None
-        with replay_module.pitch_settings(self.record):
-            game = replay_module.frame_game(self.record, self.index)
-            for tile in game.board:
-                border = None
-                if tile.coord == end:
-                    border = (config.SELECTED_COLOUR, config.SELECTED_BORDER_WIDTH)
-                elif tile.coord == start:
-                    border = (config.STEP_TARGET_COLOUR, config.STEP_TARGET_WIDTH)
-                renderer.draw_tile(tile, border, game.board)
-            renderer.draw_ball(game.board.ball)
-            renderer.draw_score(game)
+        draw_frame(self.app.renderer, self.record, self.index)
         ui.text(screen, fit("Replay - " + replay_module.who_played(self.record), 300, 14), (10, 6),
                 size=14, colour=ui.FAINT_TEXT_COLOUR)
 
@@ -1472,14 +1605,7 @@ class ReplayScreen(Screen):
                                                                 self.SEEK.height + 8))
 
         # Where we are and what happened
-        starts = self.turn_starts()
-        start_of_turn = max(s for s in starts if s <= self.index)
-        end_of_turn = min([s for s in starts if s > self.index] + [len(self.frames)])
-        moves_in_turn = end_of_turn - start_of_turn - 1
-        move_number = self.index - start_of_turn
-        turn = replay_module.frame_turn(self.record, self.index)
-        where = (f"Turn {turn}, move {move_number} of {moves_in_turn}" if move_number
-                 else f"Turn {turn}, start")
+        where = replay_module.position_text(self.record, self.index)
         notes = [m["note"] for m in self.record["timestamps"] if m["frame"] == self.index]
         line = f"{where}  -  {replay_module.describe_move(self.record, self.index)}"
         if notes:

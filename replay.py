@@ -92,10 +92,18 @@ def settings_text():
             for name in settings.EDITABLE if hasattr(config, name)}
 
 
+def pitch_info(game):
+    """What a replay stores about the pitch, to draw it later."""
+    return {"cols": config.BOARD_COLS, "rows": config.BOARD_ROWS,
+            "shifted_rows": config.SHIFTED_ROWS, "box_radius": config.KEEPER_BOX_RADIUS,
+            "tiles": [list(c) for c in sorted(game.board.tiles)],
+            "goals": {side: list(c) for side, c in game.board.goals.items()},
+            "turn_limit": game.turn_limit}
+
+
 def new_record(game, controllers, ranked=None):
     """The replay for a finished RecordingGame. controllers: {team: "human"/"ai"};
     ranked: the ranked opponent's name, if it was a ranked match."""
-    tiles = sorted(game.board.tiles)
     now = datetime.datetime.now()
     return {
         "version": VERSION,
@@ -106,15 +114,20 @@ def new_record(game, controllers, ranked=None):
         "home": config.HOME, "away": config.AWAY,
         "controllers": {str(team): kind for team, kind in controllers.items()},
         "ranked": ranked,
-        "pitch": {"cols": config.BOARD_COLS, "rows": config.BOARD_ROWS,
-                  "shifted_rows": config.SHIFTED_ROWS, "box_radius": config.KEEPER_BOX_RADIUS,
-                  "tiles": [list(c) for c in tiles],
-                  "goals": {side: list(c) for side, c in game.board.goals.items()},
-                  "turn_limit": game.turn_limit},
+        "pitch": pitch_info(game),
         "settings": settings_text(),
         "frames": game.frames,
         "timestamps": [],
     }
+
+
+def match_record(game):
+    """A replay-shaped view of a match still being played, for rewinding it:
+    its frames are the game's own list, so it stays up to date."""
+    return {"teams": {str(config.HOME): config.TEAM_NAMES[config.HOME],
+                      str(config.AWAY): config.TEAM_NAMES[config.AWAY]},
+            "home": config.HOME, "away": config.AWAY, "controllers": {}, "ranked": None,
+            "pitch": pitch_info(game), "frames": game.frames, "timestamps": []}
 
 
 # --- Files ---
@@ -232,6 +245,16 @@ def describe_move(record, index):
     if frame.get("message"):
         text += f" - {frame['message']}"
     return text
+
+
+def position_text(record, index):
+    """e.g. "Turn 4, move 2 of 6" or "Turn 4, start"."""
+    starts = turn_starts(record)
+    start = max(s for s in starts if s <= index)
+    end = min([s for s in starts if s > index] + [len(record["frames"])])
+    move = index - start
+    turn = frame_turn(record, index)
+    return f"Turn {turn}, move {move} of {end - start - 1}" if move else f"Turn {turn}, start"
 
 
 def add_timestamp(record, index, note):
